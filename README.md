@@ -24,6 +24,8 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 The connector reads one non-secret TOML file and a directory holding one file per secret; secrets are never read from environment variables. See [config.example.toml](config.example.toml) and [compose.example.yaml](compose.example.yaml).
 
+The image runs as uid 10001, and Compose mounts secret files with their host owner and mode, so make them readable by that uid: `chown 10001 secrets/* && chmod 400 secrets/*`. The connector currently loads its config and exits; try it with `docker compose run --rm connector`.
+
 ## License
 
 [AGPL-3.0](LICENSE)

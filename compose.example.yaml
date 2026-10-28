@@ -1,5 +1,10 @@
 # Example deployment. Copy next to a filled-in config.toml and a secrets/
 # directory holding one file per secret; neither belongs in this repo.
+#
+# Compose mounts each secret file as is, keeping its host owner and mode, and
+# the image runs as uid 10001. Make the secret files readable by that uid:
+#
+#   chown 10001 secrets/* && chmod 400 secrets/*
 services:
   connector:
     image: ghcr.io/hatlabs/shopify-erpnext-connector:latest
