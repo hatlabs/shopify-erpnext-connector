@@ -1,0 +1,27 @@
+name: Pull Request Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: hatlabs/shared-workflows/.github/workflows/pr-checks.yml@main
+    with:
+      skip-lintian: true
+
+  # The shared workflow passes no secrets to the run-tests action, so the
+  # deny-list check runs here where the secret is in scope.
+  fixture-denylist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check fixtures against the deny-list
+        run: ./run check-fixtures
+        env:
+          FIXTURE_DENYLIST: ${{ secrets.FIXTURE_DENYLIST }}
