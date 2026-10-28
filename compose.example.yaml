@@ -5,10 +5,13 @@
 # the image runs as uid 10001. Make the secret files readable by that uid:
 #
 #   chown 10001 secrets/* && chmod 400 secrets/*
+#
+# The connector currently loads its config and exits, so try it with
+# `docker compose run --rm connector`. A restart policy returns with the
+# service loop; until then it would restart the container in a loop.
 services:
   connector:
     image: ghcr.io/hatlabs/shopify-erpnext-connector:latest
-    restart: unless-stopped
     volumes:
       - ./config.toml:/etc/shopify-erpnext-connector/config.toml:ro
     secrets:
