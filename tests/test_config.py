@@ -192,6 +192,26 @@ def test_erpnext_url_must_be_http_or_https(
         load_config(config_path, secrets_dir)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://admin-u5er:s3cr3t-pw@erpnext.example.com",
+        "https://admin-u5er@erpnext.example.com",
+        "https://:s3cr3t-pw@erpnext.example.com",
+    ],
+)
+def test_erpnext_url_with_credentials_is_rejected_without_echoing_them(
+    config_path: Path, secrets_dir: Path, url: str
+) -> None:
+    config_path.write_text(CONFIG_TOML.replace(ERPNEXT_URL, url))
+
+    with pytest.raises(ConfigError, match="erpnext.url") as excinfo:
+        load_config(config_path, secrets_dir)
+
+    assert "s3cr3t-pw" not in str(excinfo.value)
+    assert "admin-u5er" not in str(excinfo.value)
+
+
 def test_operator_name_cannot_escape_the_secrets_directory(
     config_path: Path, secrets_dir: Path
 ) -> None:

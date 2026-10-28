@@ -122,6 +122,11 @@ def load_config(config_path: Path, secrets_dir: Path) -> Config:
         or parts.fragment
     ):
         raise document.error("'erpnext.url' must be an http(s) base URL")
+    if parts.username is not None or parts.password is not None:
+        raise document.error(
+            "'erpnext.url' must not carry credentials; "
+            "they belong in the secrets directory"
+        )
 
     return Config(
         environment=environment,
