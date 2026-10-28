@@ -115,7 +115,12 @@ def load_config(config_path: Path, secrets_dir: Path) -> Config:
         )
 
     erpnext_url = document.string("erpnext.url")
-    parts = urlsplit(erpnext_url)
+    not_a_base_url = document.error("'erpnext.url' must be an http(s) base URL")
+    try:
+        parts = urlsplit(erpnext_url)
+        _ = parts.port  # raises on a port that is not a number in range
+    except ValueError:
+        raise not_a_base_url from None
     if (
         parts.scheme not in _ERPNEXT_SCHEMES
         or not parts.hostname
@@ -123,7 +128,7 @@ def load_config(config_path: Path, secrets_dir: Path) -> Config:
         or parts.query
         or parts.fragment
     ):
-        raise document.error("'erpnext.url' must be an http(s) base URL")
+        raise not_a_base_url
     if parts.username is not None or parts.password is not None:
         raise document.error(
             "'erpnext.url' must not carry credentials; "
@@ -195,6 +200,8 @@ def _read_toml(path: Path) -> Mapping[str, object]:
         raise ConfigError(f"config file not found: {path}") from None
     except OSError as error:
         raise ConfigError(f"cannot read config file {path}: {error.strerror}") from None
+    except UnicodeDecodeError:
+        raise ConfigError(f"config file {path} is not valid UTF-8") from None
     except tomllib.TOMLDecodeError as error:
         raise ConfigError(f"{path}: invalid TOML: {error}") from None
 

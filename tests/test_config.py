@@ -212,6 +212,9 @@ def test_location_id_must_be_a_location_gid(
         "https://erpnext.example.com/app",
         "https://erpnext.example.com/?a=1",
         "https://erpnext.example.com/#x",
+        "http://[::1",
+        "https://erpnext.example.com:http",
+        "https://erpnext.example.com:99999",
     ],
 )
 def test_erpnext_url_must_be_a_base_url(
@@ -339,6 +342,15 @@ def test_invalid_toml_names_the_path(config_path: Path, secrets_dir: Path) -> No
     config_path.write_text("environment = \n")
 
     with pytest.raises(ConfigError, match=str(config_path)):
+        load_config(config_path, secrets_dir)
+
+
+def test_config_that_is_not_utf8_names_the_path(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    config_path.write_bytes(b'# K\xe4ytt\xf6\nenvironment = "staging"\n')
+
+    with pytest.raises(ConfigError, match=f"{config_path} is not valid UTF-8"):
         load_config(config_path, secrets_dir)
 
 
