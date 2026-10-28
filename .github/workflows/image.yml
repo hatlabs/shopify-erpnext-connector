@@ -9,6 +9,11 @@ permissions:
   contents: read
   packages: write
 
+# A superseded run that finished last would move `latest` back to an older commit.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   publish:
     runs-on: ubuntu-latest
