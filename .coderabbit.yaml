@@ -1,0 +1,57 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+
+language: en-GB
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+
+  path_instructions:
+    - path: '**/*'
+      instructions: |
+        ## Secrets, infrastructure and customer data must not be committed
+        This repository is public. Flag any real API key, API secret, token,
+        password, hostname, domain, IP address, internal URL, or account name,
+        including in tests, example configs and docs. Placeholders such as
+        `example.myshopify.com` and `https://erpnext.example.com` are fine;
+        real values are not.
+
+        Flag any real person's name, street address, phone number or email in
+        fixtures or docs. Fixtures carry only item codes and quantities.
+
+        ## Echo comments
+        Flag any comment that merely restates what the code already says.
+        Request removal, or replacement with a comment that explains *why*.
+
+    - path: 'src/**/*.py'
+      instructions: |
+        ## Secrets
+        Secrets are read only from files in the secrets directory. Flag any
+        secret read from an environment variable, and any secret value that
+        reaches a log line, exception message, repr or HTTP response.
+
+        ## Environment pinning
+        Each environment talks only to the shop domain, location and ERPNext
+        URL its config names. Flag a client that accepts a host or location
+        other than the pinned one.
+
+        ## Error handling
+        Flag bare `except` clauses and errors swallowed without re-raising or
+        recording the reason.
+
+    - path: 'tests/**'
+      instructions: |
+        ## Fixtures
+        Fixtures are synthetic or scrubbed: placeholder hosts, no
+        `Authorization` headers, no customer or address fields.
+
+  tools:
+    ruff:
+      enabled: true
+    markdownlint:
+      enabled: false
