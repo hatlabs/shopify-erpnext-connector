@@ -193,6 +193,45 @@ def test_erpnext_url_must_be_http_or_https(
 
 
 @pytest.mark.parametrize(
+    "location_id",
+    ["1234567890", "gid://shopify/Product/1", "gid://shopify/Location/abc"],
+)
+def test_location_id_must_be_a_location_gid(
+    config_path: Path, secrets_dir: Path, location_id: str
+) -> None:
+    config_path.write_text(CONFIG_TOML.replace(LOCATION_ID, location_id))
+
+    with pytest.raises(ConfigError, match="shopify.location_id"):
+        load_config(config_path, secrets_dir)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://",
+        "https://erpnext.example.com/app",
+        "https://erpnext.example.com/?a=1",
+        "https://erpnext.example.com/#x",
+    ],
+)
+def test_erpnext_url_must_be_a_base_url(
+    config_path: Path, secrets_dir: Path, url: str
+) -> None:
+    config_path.write_text(CONFIG_TOML.replace(ERPNEXT_URL, url))
+
+    with pytest.raises(ConfigError, match="erpnext.url"):
+        load_config(config_path, secrets_dir)
+
+
+def test_erpnext_url_trailing_slash_is_dropped(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    config_path.write_text(CONFIG_TOML.replace(ERPNEXT_URL, ERPNEXT_URL + "/"))
+
+    assert load_config(config_path, secrets_dir).erpnext_url == ERPNEXT_URL
+
+
+@pytest.mark.parametrize(
     "url",
     [
         "https://admin-u5er:s3cr3t-pw@erpnext.example.com",
@@ -218,6 +257,74 @@ def test_operator_name_cannot_escape_the_secrets_directory(
     config_path.write_text(CONFIG_TOML.replace('["alice"]', '["../alice"]'))
 
     with pytest.raises(ConfigError, match="operators"):
+        load_config(config_path, secrets_dir)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        (f'location_id = "{LOCATION_ID}"', "location_id = 1234567890"),
+        ('environment = "staging"', 'environment = ""'),
+    ],
+)
+def test_field_that_is_not_a_non_empty_string_is_rejected(
+    config_path: Path, secrets_dir: Path, original: str, replacement: str
+) -> None:
+    config_path.write_text(CONFIG_TOML.replace(original, replacement))
+
+    with pytest.raises(ConfigError, match="must be a non-empty string"):
+        load_config(config_path, secrets_dir)
+
+
+def test_table_given_as_a_string_is_rejected(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    shopify_table = (
+        f'[shopify]\nshop_domain = "{SHOP_DOMAIN}"\nlocation_id = "{LOCATION_ID}"\n'
+    )
+    config_path.write_text('shopify = "x"\n' + CONFIG_TOML.replace(shopify_table, ""))
+
+    with pytest.raises(ConfigError, match="'shopify' must be a table"):
+        load_config(config_path, secrets_dir)
+
+
+def test_operators_given_as_a_string_is_rejected(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    config_path.write_text(CONFIG_TOML.replace('["alice"]', '"alice"'))
+
+    with pytest.raises(ConfigError, match="operators"):
+        load_config(config_path, secrets_dir)
+
+
+def test_config_without_operators_has_no_operator_tokens(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    config_path.write_text(CONFIG_TOML.replace('operators = ["alice"]\n', ""))
+
+    assert load_config(config_path, secrets_dir).secrets.operator_tokens == {}
+
+
+def test_secret_that_is_not_utf8_names_the_file_without_its_content(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    (secrets_dir / "erpnext_api_key").write_bytes(b"\xff\xfeleaky-secret-value")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_path, secrets_dir)
+
+    message = str(excinfo.value)
+    assert str(secrets_dir / "erpnext_api_key") in message
+    assert "leaky-secret-value" not in message
+
+
+def test_secret_path_that_is_a_directory_cannot_be_read(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    (secrets_dir / "metrics_token").unlink()
+    (secrets_dir / "metrics_token").mkdir()
+
+    with pytest.raises(ConfigError, match="cannot read secret file"):
         load_config(config_path, secrets_dir)
 
 
