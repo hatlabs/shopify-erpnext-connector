@@ -81,7 +81,7 @@ function build-image {
 # CI Commands
 
 function check-fixtures {
-  #@ Reject real shop hosts, auth headers and deny-listed strings
+  #@ Reject real shop hosts, credentials and deny-listed strings
   #@ Category: CI
   # Matches are reported as file:line only: printing them would publish the
   # very strings this check keeps out of a public repo.
@@ -89,8 +89,14 @@ function check-fixtures {
   local hits
 
   if hits=$(git grep --untracked -nIiE \
-    "authorization['\"]?\]?[[:space:]]*[:=,]" -- tests/); then
-    echo "Authorization header values under tests/:"
+    "(authorization|x-shopify-access-token)['\"]?\]?[[:space:]]*[:=,]" -- tests/); then
+    echo "Authorization or X-Shopify-Access-Token header values under tests/:"
+    locations <<<"$hits"
+    failed=1
+  fi
+
+  if hits=$(git grep --untracked -nIiE 'shp(at|ca|pa|ss)_[[:alnum:]]' -- tests/); then
+    echo "Shopify access tokens under tests/:"
     locations <<<"$hits"
     failed=1
   fi

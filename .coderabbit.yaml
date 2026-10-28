@@ -48,7 +48,9 @@ reviews:
       instructions: |
         ## Fixtures
         Fixtures are synthetic or scrubbed: placeholder hosts, no
-        `Authorization` headers, no customer or address fields.
+        `Authorization` or `X-Shopify-Access-Token` headers, no Shopify
+        tokens (`shpat_`, `shpca_`, `shppa_`, `shpss_`), no customer or
+        address fields.
 
   tools:
     ruff:
