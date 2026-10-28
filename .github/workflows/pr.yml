@@ -1,0 +1,37 @@
+name: Pull Request Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    uses: hatlabs/shared-workflows/.github/workflows/pr-checks.yml@main
+    with:
+      skip-lintian: true
+
+  # The shared workflow passes no secrets to the run-tests action, so the
+  # deny-list check runs here where the secret is in scope.
+  # Pull requests from forks get no secrets, so the job would fail on every one.
+  fixture-denylist:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      FIXTURE_DENYLIST: ${{ secrets.FIXTURE_DENYLIST }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check fixtures against the deny-list
+        run: ./run check-fixtures
+
+      - name: Check the pull request's commits against the deny-list
+        run: ./run check-history "$BASE_SHA"
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}

@@ -1,0 +1,34 @@
+# Example deployment. Copy next to a filled-in config.toml and a secrets/
+# directory holding one file per secret; neither belongs in this repo.
+#
+# Compose mounts each secret file as is, keeping its host owner and mode, and
+# the image runs as uid 10001. Make the secret files readable by that uid:
+#
+#   chown 10001 secrets/* && chmod 400 secrets/*
+#
+# The connector currently loads its config and exits, so try it with
+# `docker compose run --rm connector`. A restart policy returns with the
+# service loop; until then it would restart the container in a loop.
+services:
+  connector:
+    image: ghcr.io/hatlabs/shopify-erpnext-connector:latest
+    volumes:
+      - ./config.toml:/etc/shopify-erpnext-connector/config.toml:ro
+    secrets:
+      - erpnext_api_key
+      - erpnext_api_secret
+      - shopify_access_token
+      - metrics_token
+      - operator_token_alice
+
+secrets:
+  erpnext_api_key:
+    file: ./secrets/erpnext_api_key
+  erpnext_api_secret:
+    file: ./secrets/erpnext_api_secret
+  shopify_access_token:
+    file: ./secrets/shopify_access_token
+  metrics_token:
+    file: ./secrets/metrics_token
+  operator_token_alice:
+    file: ./secrets/operator_token_alice

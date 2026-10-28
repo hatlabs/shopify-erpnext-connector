@@ -1,0 +1,17 @@
+# Copy to config.toml (gitignored) and fill in the environment's values.
+# Secrets do not go here: each is one file in the secrets directory, named
+# erpnext_api_key, erpnext_api_secret, shopify_access_token, metrics_token,
+# and operator_token_<name> for each operator below.
+
+# staging or production
+environment = "staging"
+
+# Operators allowed to use the CLI; each needs an operator_token_<name> file.
+operators = ["alice"]
+
+[shopify]
+shop_domain = "example.myshopify.com"
+location_id = "gid://shopify/Location/1234567890"
+
+[erpnext]
+url = "https://erpnext.example.com"

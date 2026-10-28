@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+#
+# usage: ./run command [argument ...]
+#
+# Commands for shopify-erpnext-connector development.
+#
+
+set -o nounset
+set -o pipefail
+set -o errexit
+
+# Change the current directory to the project root.
+PROJECT_ROOT=${0%/*}
+if [[ $0 != $PROJECT_ROOT && $PROJECT_ROOT != "" ]]; then
+  cd "$PROJECT_ROOT"
+fi
+readonly PROJECT_ROOT=$(pwd)
+
+readonly IMAGE_NAME=shopify-erpnext-connector
+
+################################################################################
+# Helper Functions
+
+function locations {
+  #@ Print file:line of each match, never the matched text
+  cut -d: -f1,2 | sed 's/^/  /'
+}
+
+function denylist-entries {
+  #@ Print the non-blank lines of FIXTURE_DENYLIST, trimmed
+  local entry
+  while IFS= read -r entry; do
+    entry=${entry#"${entry%%[![:space:]]*}"}
+    entry=${entry%"${entry##*[![:space:]]}"}
+    [[ -n $entry ]] && echo "$entry"
+  done <<<"${FIXTURE_DENYLIST:-}"
+  return 0
+}
+
+################################################################################
+# Development Commands
+
+function sync {
+  #@ Create the virtual environment and install dependencies
+  #@ Category: Development
+  uv sync --extra dev
+}
+
+function lint {
+  #@ Check code with ruff (lint and formatting)
+  #@ Category: Development
+  uv run --extra dev ruff check src tests
+  uv run --extra dev ruff format --check src tests
+}
+
+function format {
+  #@ Auto-format code with ruff
+  #@ Category: Development
+  uv run --extra dev ruff check --fix src tests
+  uv run --extra dev ruff format src tests
+}
+
+function typecheck {
+  #@ Run type checking with ty
+  #@ Category: Development
+  uv run --extra dev ty check src tests
+}
+
+function test {
+  #@ Run tests with pytest (extra arguments go to pytest)
+  #@ Category: Development
+  uv run --extra dev pytest "$@"
+}
+
+function clean {
+  #@ Remove caches and build artifacts
+  #@ Category: Development
+  find . -type d -name __pycache__ -prune -exec rm -r {} + 2>/dev/null || true
+  rm -rf .pytest_cache .ruff_cache build dist 2>/dev/null || true
+}
+
+################################################################################
+# Docker Commands
+
+function build-image {
+  #@ Build the container image locally
+  #@ Category: Docker
+  docker build -t "$IMAGE_NAME" .
+}
+
+################################################################################
+# CI Commands
+
+function check-fixtures {
+  #@ Reject real shop hosts, credentials and deny-listed strings
+  #@ Category: CI
+  # Matches are reported as file:line only: printing them would publish the
+  # very strings this check keeps out of a public repo.
+  local failed=0
+  local hits
+
+  if hits=$(git grep --untracked -nIiE \
+    "(authorization|x-shopify-access-token)['\"]?\]?[[:space:]]*[:=,]" -- tests/); then
+    echo "Authorization or X-Shopify-Access-Token header values under tests/:"
+    locations <<<"$hits"
+    failed=1
+  fi
+
+  if hits=$(git grep --untracked -nIiE 'shp(at|ca|pa|ss)_[[:alnum:]]' -- tests/); then
+    echo "Shopify access tokens under tests/:"
+    locations <<<"$hits"
+    failed=1
+  fi
+
+  if hits=$(git grep --untracked -nIioE '[a-z0-9.-]+\.myshopify\.com' -- tests/ |
+    grep -viE ':([a-z0-9-]+\.)*example\.myshopify\.com$'); then
+    echo "Non-placeholder myshopify.com hosts under tests/ (use example.myshopify.com):"
+    locations <<<"$hits"
+    failed=1
+  fi
+
+  local entries
+  entries=$(denylist-entries)
+  if [[ -z $entries ]]; then
+    # The annotation makes the skip visible on the PR, where a log line is not.
+    echo "${GITHUB_ACTIONS:+::warning::}FIXTURE_DENYLIST is not set; skipping the deny-list check."
+  else
+    local entry
+    while IFS= read -r entry; do
+      if hits=$(git grep --untracked -nIiF -e "$entry" -- .); then
+        echo "Deny-listed string found:"
+        locations <<<"$hits"
+        failed=1
+      fi
+    done <<<"$entries"
+  fi
+
+  if [[ $failed -ne 0 ]]; then
+    return 1
+  fi
+  echo "Fixture check passed."
+}
+
+function check-history {
+  #@ Reject deny-listed strings in the diffs and messages of commits after a base
+  #@ Category: CI
+  # A merge commit keeps every commit of the branch, so a string one commit adds
+  # and a later one removes is still published. -S finds both commits.
+  local base=${1:?usage: ./run check-history <base-commit>}
+  local entries
+  entries=$(denylist-entries)
+  if [[ -z $entries ]]; then
+    echo "FIXTURE_DENYLIST is not set; the history check has nothing to check against." >&2
+    return 1
+  fi
+
+  local failed=0
+  local entry hits
+  while IFS= read -r entry; do
+    hits=$(
+      git log --format=%h -i -S"$entry" "$base..HEAD"
+      git log --format=%h -i -F --grep="$entry" "$base..HEAD"
+    )
+    if [[ -n $hits ]]; then
+      echo "Deny-listed string in the diff or message of:"
+      sort -u <<<"$hits" | sed 's/^/  /'
+      failed=1
+    fi
+  done <<<"$entries"
+
+  if [[ $failed -ne 0 ]]; then
+    return 1
+  fi
+  echo "History check passed."
+}
+
+function ci-check {
+  #@ Run every check CI runs: lint, typecheck, test, fixture check
+  #@ Category: CI
+  lint
+  typecheck
+  test
+  check-fixtures
+}
+
+################################################################################
+# Help System
+
+function help {
+  #@ Show this help message
+  #@ Category: Meta
+  echo "shopify-erpnext-connector - Development Commands"
+  echo "================================================"
+  echo ""
+  echo "Available commands:"
+
+  # Extract function definitions and their help comments
+  awk '/^function / {
+    fname = $2
+    sub(/[({].*/, "", fname)
+    getline
+    if ($0 ~ /#@/) {
+      desc = $0
+      sub(/.*#@ /, "", desc)
+      sub(/ *$/, "", desc)
+      getline
+      if ($0 ~ /#@ Category:/) {
+        cat = $0
+        sub(/.*Category: /, "", cat)
+        sub(/ *$/, "", cat)
+        if (!seen[cat]++) categories[++cat_count] = cat
+        commands[cat, ++cmd_count[cat]] = fname
+        descriptions[cat, cmd_count[cat]] = desc
+      }
+    }
+  }
+  END {
+    for (i = 1; i <= cat_count; i++) {
+      cat = categories[i]
+      print "\n" cat ":"
+      for (j = 1; j <= cmd_count[cat]; j++) {
+        printf "  %-25s %s\n", commands[cat, j], descriptions[cat, j]
+      }
+    }
+  }' "$0"
+
+  echo ""
+  echo "Usage: ./run <command> [arguments...]"
+  echo ""
+}
+
+################################################################################
+# Commands end.
+
+TIMEFORMAT=$'\nTask completed in %3lR'
+time "${@:-help}"

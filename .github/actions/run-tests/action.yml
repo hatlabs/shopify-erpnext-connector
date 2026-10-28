@@ -1,0 +1,20 @@
+name: 'Run Tests'
+description: 'Run lint, typecheck, tests and the fixture check for shopify-erpnext-connector'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version-file: '.python-version'
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+
+    - name: Run CI checks
+      run: ./run ci-check
+      shell: bash
+      env:
+        # Fail on a uv.lock that doesn't match pyproject.toml instead of re-locking.
+        UV_LOCKED: '1'
