@@ -20,12 +20,14 @@ _LOCATION_ID = re.compile(r"gid://shopify/Location/[0-9]+")
 _OPERATOR_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 _ERPNEXT_SCHEMES = ("http", "https")
 
-_Schema = Mapping[str, "type | _Schema"]
+# Allowed field names: None marks a leaf, a mapping a nested table. Values are
+# type-checked by the getters that read them.
+_Schema = Mapping[str, "_Schema | None"]
 _SCHEMA: _Schema = {
-    "environment": str,
-    "operators": list,
-    "shopify": {"shop_domain": str, "location_id": str},
-    "erpnext": {"url": str},
+    "environment": None,
+    "operators": None,
+    "shopify": {"shop_domain": None, "location_id": None},
+    "erpnext": {"url": None},
 }
 
 
@@ -150,10 +152,10 @@ class _Document:
     ) -> None:
         for key, value in table.items():
             dotted = prefix + key
-            expected = schema.get(key)
-            if expected is None:
+            if key not in schema:
                 raise self.error(f"unknown field '{dotted}'")
-            if isinstance(expected, Mapping):
+            expected = schema[key]
+            if expected is not None:
                 if not isinstance(value, Mapping):
                     raise self.error(f"'{dotted}' must be a table")
                 self.reject_unknown_fields(value, expected, prefix=dotted + ".")
