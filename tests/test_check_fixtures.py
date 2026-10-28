@@ -74,3 +74,105 @@ def test_placeholder_shop_host_passes(tmp_path: Path, host: str) -> None:
     result = check_fixtures(tmp_path, f"https://{host}/admin", denylist=DENYLISTED)
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(("in_actions", "annotated"), [(True, True), (False, False)])
+def test_unset_denylist_is_annotated_only_in_actions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, in_actions: bool, annotated: bool
+) -> None:
+    if in_actions:
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    else:
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+
+    result = check_fixtures(tmp_path, "name = placeholder")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("::warning::" in result.stdout) == annotated
+
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def commit(repo: Path, content: str, message: str = "change") -> str:
+    (repo / "file.txt").write_text(content + "\n")
+    git(repo, "add", "file.txt")
+    git(repo, "commit", "-q", "-m", message)
+    return git(repo, "rev-parse", "--short", "HEAD")
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    shutil.copy(RUN_SCRIPT, tmp_path / "run")
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "add", "run")
+    commit(tmp_path, "base")
+    return tmp_path
+
+
+def check_history(
+    repo: Path, base: str, denylist: str | None = DENYLISTED
+) -> subprocess.CompletedProcess[str]:
+    env = {k: v for k, v in os.environ.items() if k != "FIXTURE_DENYLIST"}
+    if denylist is not None:
+        env["FIXTURE_DENYLIST"] = denylist
+    return subprocess.run(
+        ["bash", "run", "check-history", base],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_string_added_then_removed_is_found_in_history(repo: Path) -> None:
+    base = git(repo, "rev-parse", "HEAD")
+    added = commit(repo, f"name = {DENYLISTED.upper()}")
+    commit(repo, "name = placeholder")
+
+    result = check_history(repo, base)
+
+    assert result.returncode != 0
+    assert added in result.stdout
+    assert DENYLISTED.upper() not in result.stdout + result.stderr
+
+
+def test_string_in_a_commit_message_is_found(repo: Path) -> None:
+    base = git(repo, "rev-parse", "HEAD")
+    sha = commit(repo, "name = placeholder", message=f"use {DENYLISTED}")
+
+    result = check_history(repo, base)
+
+    assert result.returncode != 0
+    assert sha in result.stdout
+    assert DENYLISTED not in result.stdout + result.stderr
+
+
+def test_clean_history_passes(repo: Path) -> None:
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, "name = placeholder")
+
+    result = check_history(repo, base)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("denylist", [None, "", " \n"])
+def test_history_check_refuses_to_run_without_a_denylist(
+    repo: Path, denylist: str | None
+) -> None:
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, "name = placeholder")
+
+    result = check_history(repo, base, denylist=denylist)
+
+    assert result.returncode != 0
+    assert "FIXTURE_DENYLIST" in result.stdout + result.stderr

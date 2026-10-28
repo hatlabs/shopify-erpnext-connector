@@ -26,6 +26,17 @@ function locations {
   cut -d: -f1,2 | sed 's/^/  /'
 }
 
+function denylist-entries {
+  #@ Print the non-blank lines of FIXTURE_DENYLIST, trimmed
+  local entry
+  while IFS= read -r entry; do
+    entry=${entry#"${entry%%[![:space:]]*}"}
+    entry=${entry%"${entry##*[![:space:]]}"}
+    [[ -n $entry ]] && echo "$entry"
+  done <<<"${FIXTURE_DENYLIST:-}"
+  return 0
+}
+
 ################################################################################
 # Development Commands
 
@@ -108,26 +119,59 @@ function check-fixtures {
     failed=1
   fi
 
-  if [[ -z ${FIXTURE_DENYLIST:-} ]]; then
-    echo "FIXTURE_DENYLIST is not set; skipping the deny-list check."
+  local entries
+  entries=$(denylist-entries)
+  if [[ -z $entries ]]; then
+    # The annotation makes the skip visible on the PR, where a log line is not.
+    echo "${GITHUB_ACTIONS:+::warning::}FIXTURE_DENYLIST is not set; skipping the deny-list check."
   else
     local entry
     while IFS= read -r entry; do
-      entry=${entry#"${entry%%[![:space:]]*}"}
-      entry=${entry%"${entry##*[![:space:]]}"}
-      [[ -z $entry ]] && continue
       if hits=$(git grep --untracked -nIiF -e "$entry" -- .); then
         echo "Deny-listed string found:"
         locations <<<"$hits"
         failed=1
       fi
-    done <<<"$FIXTURE_DENYLIST"
+    done <<<"$entries"
   fi
 
   if [[ $failed -ne 0 ]]; then
     return 1
   fi
   echo "Fixture check passed."
+}
+
+function check-history {
+  #@ Reject deny-listed strings in the diffs and messages of commits after a base
+  #@ Category: CI
+  # A merge commit keeps every commit of the branch, so a string one commit adds
+  # and a later one removes is still published. -S finds both commits.
+  local base=${1:?usage: ./run check-history <base-commit>}
+  local entries
+  entries=$(denylist-entries)
+  if [[ -z $entries ]]; then
+    echo "FIXTURE_DENYLIST is not set; the history check has nothing to check against." >&2
+    return 1
+  fi
+
+  local failed=0
+  local entry hits
+  while IFS= read -r entry; do
+    hits=$(
+      git log --format=%h -i -S"$entry" "$base..HEAD"
+      git log --format=%h -i -F --grep="$entry" "$base..HEAD"
+    )
+    if [[ -n $hits ]]; then
+      echo "Deny-listed string in the diff or message of:"
+      sort -u <<<"$hits" | sed 's/^/  /'
+      failed=1
+    fi
+  done <<<"$entries"
+
+  if [[ $failed -ne 0 ]]; then
+    return 1
+  fi
+  echo "History check passed."
 }
 
 function ci-check {
