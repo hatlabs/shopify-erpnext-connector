@@ -1,7 +1,7 @@
 """The connector's SQLite store: schema migrations, WAL mode and retention.
 
 Connections run in autocommit mode (`isolation_level=None`); callers group
-writes with explicit `BEGIN` and `COMMIT`.
+writes with `transaction`.
 
 Connector timestamps are UTC text from `utc_timestamp`, fixed width so that
 text order is time order. The watermark is the exception: it holds ERPNext's
@@ -12,7 +12,8 @@ Identifiers are text: Shopify GIDs and ERPNext item codes.
 """
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -175,6 +176,18 @@ def purge_push_history(connection: sqlite3.Connection, now: datetime) -> int:
         "DELETE FROM push_history WHERE attempted_at < ?", (cutoff,)
     )
     return cursor.rowcount
+
+
+@contextmanager
+def transaction(connection: sqlite3.Connection) -> Generator[None]:
+    """Commit the block's writes together, or roll them all back on an error."""
+    connection.execute("BEGIN")
+    try:
+        yield
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def dry_run(connection: sqlite3.Connection) -> bool:

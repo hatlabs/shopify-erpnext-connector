@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
-from shopify_erpnext_connector.store import utc_timestamp
+from shopify_erpnext_connector.store import transaction, utc_timestamp
 
 CLI_NAME = "shopify-erpnext-connector"
 
@@ -99,8 +99,7 @@ def record_check(
         raise ValueError(f"record_check({kind}): found a problem of another kind")
     if len(found_subjects) != len(found):
         raise ValueError(f"record_check({kind}): a subject is listed twice")
-    connection.execute("BEGIN")
-    try:
+    with transaction(connection):
         for problem in found:
             _record_found(connection, problem, timestamp)
         for stored in _open_of_kind(connection, kind):
@@ -113,10 +112,6 @@ def record_check(
                 "WHERE kind = ? AND subject = ?",
                 (timestamp, kind, stored.subject),
             )
-        connection.execute("COMMIT")
-    except BaseException:
-        connection.execute("ROLLBACK")
-        raise
 
 
 def get_problem(

@@ -19,8 +19,7 @@ so Shopify can recognise it if the first attempt was applied.
 import logging
 import sqlite3
 from collections import Counter
-from collections.abc import Generator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -41,7 +40,7 @@ from shopify_erpnext_connector.shopify import (
     entry_index,
     new_idempotency_key,
 )
-from shopify_erpnext_connector.store import utc_timestamp
+from shopify_erpnext_connector.store import transaction, utc_timestamp
 
 # The most IDs `nodes` accepts in one query.
 LEVELS_PAGE_SIZE = 250
@@ -191,7 +190,7 @@ def push(
     stamp = utc_timestamp(now)
     results: dict[str, _Outcome] = {}
     to_send: list[PushTarget] = []
-    with _transaction(connection):
+    with transaction(connection):
         for target in targets:
             _record_read(connection, target, stamp)
             if target.value == target.current:
@@ -376,7 +375,7 @@ def _record_outcomes(
     key: str,
     stamp: str,
 ) -> None:
-    with _transaction(connection):
+    with transaction(connection):
         connection.executemany(
             "INSERT INTO push_history (variant_id, available, change_from,"
             " idempotency_key, attempted_at, outcome) VALUES (?, ?, ?, ?, ?, ?)",
@@ -443,14 +442,3 @@ def stale_pushes(
             "Variants": ", ".join(sorted(stale)[:STALE_VARIANTS_SHOWN]),
         },
     )
-
-
-@contextmanager
-def _transaction(connection: sqlite3.Connection) -> Generator[None]:
-    connection.execute("BEGIN")
-    try:
-        yield
-    except BaseException:
-        connection.execute("ROLLBACK")
-        raise
-    connection.execute("COMMIT")

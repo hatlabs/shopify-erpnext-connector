@@ -13,13 +13,12 @@ worker's in-memory backoff, not by this count.
 """
 
 import sqlite3
-from collections.abc import Collection, Generator, Mapping
-from contextlib import contextmanager
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from shopify_erpnext_connector.erpnext import ErpNextClient, ErpNextError, Filter
-from shopify_erpnext_connector.store import utc_timestamp
+from shopify_erpnext_connector.store import transaction, utc_timestamp
 
 # About ten times the largest stamp-to-commit gap measured on ERPNext.
 POLL_OVERLAP = timedelta(seconds=60)
@@ -80,7 +79,7 @@ def poll_bins(
     if current is not None:
         stamps.append(current)
     latest = max(stamps, default=None)
-    with _transaction(connection):
+    with transaction(connection):
         _insert_dirty(connection, changed, now)
         if latest is not None and latest != current:
             connection.execute(
@@ -99,12 +98,12 @@ def mark_dirty(
     connection: sqlite3.Connection, item_codes: Collection[str], now: datetime
 ) -> None:
     """Mark items dirty; an item already dirty keeps its time and attempts."""
-    with _transaction(connection):
+    with transaction(connection):
         _insert_dirty(connection, item_codes, now)
 
 
 def clear_dirty(connection: sqlite3.Connection, item_codes: Collection[str]) -> None:
-    with _transaction(connection):
+    with transaction(connection):
         connection.executemany(
             "DELETE FROM dirty_items WHERE item_code = ?",
             [(code,) for code in item_codes],
@@ -114,7 +113,7 @@ def clear_dirty(connection: sqlite3.Connection, item_codes: Collection[str]) -> 
 def record_failed_attempt(
     connection: sqlite3.Connection, item_codes: Collection[str]
 ) -> None:
-    with _transaction(connection):
+    with transaction(connection):
         connection.executemany(
             "UPDATE dirty_items SET attempts = attempts + 1 WHERE item_code = ?",
             [(code,) for code in item_codes],
@@ -126,17 +125,6 @@ def dirty_items(connection: sqlite3.Connection) -> dict[str, DirtyItem]:
         "SELECT item_code, marked_at, attempts FROM dirty_items ORDER BY item_code"
     ).fetchall()
     return {code: DirtyItem(marked_at, attempts) for code, marked_at, attempts in rows}
-
-
-@contextmanager
-def _transaction(connection: sqlite3.Connection) -> Generator[None]:
-    connection.execute("BEGIN")
-    try:
-        yield
-        connection.execute("COMMIT")
-    except BaseException:
-        connection.execute("ROLLBACK")
-        raise
 
 
 def _insert_dirty(
