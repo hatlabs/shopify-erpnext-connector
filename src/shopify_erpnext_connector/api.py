@@ -34,8 +34,10 @@ from socketserver import BaseServer
 from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
 
+from shopify_erpnext_connector.bindings import load_sku_changes
 from shopify_erpnext_connector.config import Config
 from shopify_erpnext_connector.problems import (
+    ProblemKind,
     StoredProblem,
     count_open_problems,
     count_unsent_emails,
@@ -46,6 +48,7 @@ from shopify_erpnext_connector.problems import (
 )
 from shopify_erpnext_connector.push import unpushed_since
 from shopify_erpnext_connector.store import dry_run, utc_timestamp
+from shopify_erpnext_connector.worker import SKU_DETAIL
 
 ENVIRONMENT_HEADER = "X-Connector-Environment"
 JSON_CONTENT_TYPE = "application/json"
@@ -255,6 +258,34 @@ class ApiServer:
             return self.error(HTTPStatus.NOT_FOUND, f"no problem {key}")
         return self.json(HTTPStatus.OK, {"problem": _problem_json(stored)})
 
+    def bindings(self, request: _Request) -> _Response:
+        problems = open_problems(request.connection)
+
+        def of_kind(kind: ProblemKind) -> list[dict[str, object]]:
+            return [_problem_json(p) for p in problems if p.kind is kind]
+
+        new_skus = {
+            p.subject: p.details.get(SKU_DETAIL)
+            for p in problems
+            if p.kind is ProblemKind.CHANGED_SKU
+        }
+        return self.json(
+            HTTPStatus.OK,
+            {
+                "unbound": of_kind(ProblemKind.UNBOUND_SKU),
+                "ambiguous": of_kind(ProblemKind.AMBIGUOUS_SKU),
+                "sku_changes": [
+                    {
+                        "variant_id": change.variant_id,
+                        "bound_item_code": change.bound_item_code,
+                        "sku": new_skus.get(change.variant_id),
+                        "detected_at": change.detected_at,
+                    }
+                    for change in load_sku_changes(request.connection)
+                ],
+            },
+        )
+
     def metrics(self, request: _Request) -> _Response:
         connection = request.connection
         now = self._clock()
@@ -332,6 +363,7 @@ _ROUTES: Mapping[str, _Route] = {
     "/metrics": _Route("GET", _Access.METRICS, ApiServer.metrics),
     "/problems": _Route("GET", _Access.OPERATOR, ApiServer.problems),
     "/problem": _Route("GET", _Access.OPERATOR, ApiServer.problem),
+    "/bindings": _Route("GET", _Access.OPERATOR, ApiServer.bindings),
 }
 
 

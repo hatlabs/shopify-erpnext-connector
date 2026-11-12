@@ -268,6 +268,24 @@ def load_bindings(connection: sqlite3.Connection) -> list[Binding]:
     return [Binding(*row) for row in rows]
 
 
+@dataclass(frozen=True)
+class SkuChange:
+    """A variant held unbound because its SKU changed since it was bound."""
+
+    variant_id: str
+    bound_item_code: str
+    detected_at: str
+
+
+def load_sku_changes(connection: sqlite3.Connection) -> list[SkuChange]:
+    """The held SKU changes, oldest first."""
+    rows = connection.execute(
+        "SELECT variant_id, bound_item_code, detected_at FROM sku_changes"
+        " ORDER BY detected_at, variant_id"
+    ).fetchall()
+    return [SkuChange(*row) for row in rows]
+
+
 def save_bindings(
     connection: sqlite3.Connection, result: BindingResult, now: datetime
 ) -> None:

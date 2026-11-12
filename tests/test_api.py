@@ -619,3 +619,79 @@ def test_problem_without_a_key_is_a_bad_request(client: httpx.Client) -> None:
 
     assert response.status_code == 400
     assert "key" in response.json()["error"]
+
+
+def hold_sku_change(
+    store: sqlite3.Connection, variant_id: str, bound_item_code: str, sku: str
+) -> None:
+    store.execute(
+        "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
+        " VALUES (?, ?, ?)",
+        (variant_id, bound_item_code, utc_timestamp(NOW)),
+    )
+    record_check(
+        store,
+        ProblemKind.CHANGED_SKU,
+        [Problem(ProblemKind.CHANGED_SKU, variant_id, {"SKU": sku})],
+        NOW,
+    )
+
+
+def test_bindings_lists_unbound_ambiguous_and_held_variants(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    third = "gid://shopify/ProductVariant/1003"
+    record_check(
+        store,
+        ProblemKind.UNBOUND_SKU,
+        [Problem(ProblemKind.UNBOUND_SKU, VARIANT, {"SKU": "TEST-SKU-001"})],
+        NOW,
+    )
+    record_check(
+        store,
+        ProblemKind.AMBIGUOUS_SKU,
+        [Problem(ProblemKind.AMBIGUOUS_SKU, OTHER_VARIANT, {"SKU": "TEST-SKU-002"})],
+        NOW,
+    )
+    hold_sku_change(store, third, "TEST-ITEM-003", "TEST-SKU-003-NEW")
+    record_check(
+        store,
+        ProblemKind.OVERSELL,
+        [Problem(ProblemKind.OVERSELL, VARIANT, {"Item": "TEST-ITEM-001"})],
+        NOW,
+    )
+
+    response = client.get("/bindings", headers=operator())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [p["subject"] for p in body["unbound"]] == [VARIANT]
+    assert body["unbound"][0]["details"] == {"SKU": "TEST-SKU-001"}
+    assert [p["subject"] for p in body["ambiguous"]] == [OTHER_VARIANT]
+    assert body["sku_changes"] == [
+        {
+            "variant_id": third,
+            "bound_item_code": "TEST-ITEM-003",
+            "sku": "TEST-SKU-003-NEW",
+            "detected_at": utc_timestamp(NOW),
+        }
+    ]
+
+
+def test_bindings_when_every_variant_is_bound(client: httpx.Client) -> None:
+    body = client.get("/bindings", headers=operator()).json()
+
+    assert body["unbound"] == []
+    assert body["ambiguous"] == []
+    assert body["sku_changes"] == []
+
+
+def test_held_sku_change_without_an_open_problem_has_no_sku(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+    record_check(store, ProblemKind.CHANGED_SKU, [], NOW)
+
+    body = client.get("/bindings", headers=operator()).json()
+
+    assert body["sku_changes"][0]["sku"] is None
