@@ -36,3 +36,9 @@ sender = "notifications@example.com"
 poll_interval_seconds = 5
 # A variant whose stock has gone unpushed this long becomes a problem.
 push_stale_after_minutes = 30
+
+# Optional; the default is shown.
+[api]
+# The port of the operator CLI's API and the metrics endpoint, on every
+# interface of the container. TLS is terminated in front of it.
+port = 8080

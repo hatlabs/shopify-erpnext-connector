@@ -4,7 +4,9 @@ from datetime import timedelta
 from pathlib import Path
 
 from shopify_erpnext_connector.config import (
+    DEFAULT_API_PORT,
     DEFAULT_STORE_PATH,
+    ApiConfig,
     Config,
     EmailConfig,
     Environment,
@@ -45,6 +47,7 @@ def make_config(
         worker=WorkerConfig(
             poll_interval=POLL_INTERVAL, push_stale_after=PUSH_STALE_AFTER
         ),
+        api=ApiConfig(port=DEFAULT_API_PORT),
         store_path=Path(DEFAULT_STORE_PATH),
         secrets=Secrets(
             erpnext_api_key=Secret(ERPNEXT_API_KEY),

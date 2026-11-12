@@ -4,7 +4,9 @@ from pathlib import Path
 import pytest
 
 from shopify_erpnext_connector.config import (
+    DEFAULT_API_PORT,
     DEFAULT_STORE_PATH,
+    ApiConfig,
     ConfigError,
     EmailConfig,
     Environment,
@@ -435,7 +437,9 @@ def test_example_config_loads(tmp_path: Path) -> None:
     ]:
         (secrets / name).write_text("placeholder")
 
-    assert load_config(example, secrets).shop_domain == "example.myshopify.com"
+    config = load_config(example, secrets)
+    assert config.shop_domain == "example.myshopify.com"
+    assert config.api.port == DEFAULT_API_PORT
 
 
 def test_worker_settings_and_store_path_have_defaults(
@@ -508,4 +512,34 @@ def test_store_path_must_be_a_non_empty_string(
     config_path.write_text('store_path = ""\n' + CONFIG_TOML)
 
     with pytest.raises(ConfigError, match="'store_path' must be a non-empty string"):
+        load_config(config_path, secrets_dir)
+
+
+def test_api_port_has_a_default(config_path: Path, secrets_dir: Path) -> None:
+    assert load_config(config_path, secrets_dir).api == ApiConfig(port=DEFAULT_API_PORT)
+
+
+@pytest.mark.parametrize("port", [1, 9000, 65535])
+def test_api_port_can_be_set(config_path: Path, secrets_dir: Path, port: int) -> None:
+    config_path.write_text(CONFIG_TOML + f"\n[api]\nport = {port}\n")
+
+    assert load_config(config_path, secrets_dir).api == ApiConfig(port=port)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "65536", "80.5", '"8080"', "true"])
+def test_api_port_must_be_a_port_number(
+    config_path: Path, secrets_dir: Path, value: str
+) -> None:
+    config_path.write_text(CONFIG_TOML + f"\n[api]\nport = {value}\n")
+
+    with pytest.raises(
+        ConfigError, match="'api.port' must be a whole number from 1 to 65535"
+    ):
+        load_config(config_path, secrets_dir)
+
+
+def test_unknown_api_field_is_rejected(config_path: Path, secrets_dir: Path) -> None:
+    config_path.write_text(CONFIG_TOML + '\n[api]\nhost = "0.0.0.0"\n')
+
+    with pytest.raises(ConfigError, match="api.host"):
         load_config(config_path, secrets_dir)
