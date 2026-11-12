@@ -9,11 +9,17 @@ import re
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from shopify_erpnext_connector.numeric import is_integer, is_number
+
 OPERATOR_TOKEN_PREFIX = "operator_token_"
+DEFAULT_STORE_PATH = "/var/lib/shopify-erpnext-connector/connector.sqlite3"
+DEFAULT_POLL_INTERVAL_SECONDS = 5
+DEFAULT_PUSH_STALE_AFTER_MINUTES = 30
 
 _SHOP_DOMAIN = re.compile(r"(?:[a-z0-9-]+\.)+myshopify\.com")
 _LOCATION_ID = re.compile(r"gid://shopify/Location/[0-9]+")
@@ -27,9 +33,11 @@ _Schema = Mapping[str, "_Schema | None"]
 _SCHEMA: _Schema = {
     "environment": None,
     "operators": None,
+    "store_path": None,
     "shopify": {"shop_domain": None, "location_id": None},
-    "erpnext": {"url": None},
+    "erpnext": {"url": None, "warehouse": None},
     "email": {"enabled": None, "recipient": None, "sender": None},
+    "worker": {"poll_interval_seconds": None, "push_stale_after_minutes": None},
 }
 
 
@@ -91,12 +99,23 @@ class EmailConfig:
 
 
 @dataclass(frozen=True)
+class WorkerConfig:
+    """Tunables of the worker loop, set from measured load per environment."""
+
+    poll_interval: timedelta
+    push_stale_after: timedelta
+
+
+@dataclass(frozen=True)
 class Config:
     environment: Environment
     shop_domain: str
     location_id: str
     erpnext_url: str
+    warehouse: str
     email: EmailConfig
+    worker: WorkerConfig
+    store_path: Path
     secrets: Secrets
 
 
@@ -152,10 +171,28 @@ def load_config(config_path: Path, secrets_dir: Path) -> Config:
         shop_domain=shop_domain,
         location_id=location_id,
         erpnext_url=erpnext_url.rstrip("/"),
+        warehouse=document.string("erpnext.warehouse"),
         email=EmailConfig(
             enabled=document.boolean("email.enabled"),
             recipient=document.email_address("email.recipient"),
             sender=document.email_address("email.sender"),
+        ),
+        worker=WorkerConfig(
+            poll_interval=timedelta(
+                seconds=document.positive_number(
+                    "worker.poll_interval_seconds", DEFAULT_POLL_INTERVAL_SECONDS
+                )
+            ),
+            push_stale_after=timedelta(
+                minutes=document.positive_integer(
+                    "worker.push_stale_after_minutes", DEFAULT_PUSH_STALE_AFTER_MINUTES
+                )
+            ),
+        ),
+        store_path=Path(
+            document.string("store_path")
+            if document.has("store_path")
+            else DEFAULT_STORE_PATH
         ),
         secrets=Secrets.read(secrets_dir, document.operators()),
     )
@@ -193,6 +230,29 @@ class _Document:
         value = table.get(key)
         if value is None:
             raise self.error(f"missing required field '{dotted}'")
+        return value
+
+    def has(self, dotted: str) -> bool:
+        try:
+            self.value(dotted)
+        except ConfigError:
+            return False
+        return True
+
+    def positive_number(self, dotted: str, default: float) -> float:
+        if not self.has(dotted):
+            return default
+        value = self.value(dotted)
+        if not is_number(value) or value <= 0:
+            raise self.error(f"'{dotted}' must be a positive number")
+        return value
+
+    def positive_integer(self, dotted: str, default: int) -> int:
+        if not self.has(dotted):
+            return default
+        value = self.value(dotted)
+        if not is_integer(value) or value <= 0:
+            raise self.error(f"'{dotted}' must be a positive whole number")
         return value
 
     def string(self, dotted: str) -> str:

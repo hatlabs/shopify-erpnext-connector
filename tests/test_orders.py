@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
-from helpers import ERPNEXT_URL, SHOP_DOMAIN, make_config
+from helpers import ERPNEXT_URL, SHOP_DOMAIN, WAREHOUSE, make_config
 
 from shopify_erpnext_connector.erpnext import ErpNextClient, ErpNextError
 from shopify_erpnext_connector.orders import (
@@ -25,7 +25,6 @@ from shopify_erpnext_connector.orders import (
 from shopify_erpnext_connector.problems import Problem, ProblemKind
 from shopify_erpnext_connector.shopify import ShopifyClient, ShopifyError
 
-WAREHOUSE = "Stores - TEST"
 NOW = datetime(2026, 11, 12, 10, 0, tzinfo=UTC)
 PAST_GRACE = NOW - UNMIRRORED_GRACE
 INSIDE_GRACE = NOW - UNMIRRORED_GRACE + timedelta(seconds=1)

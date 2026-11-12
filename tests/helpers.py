@@ -1,16 +1,24 @@
 """Shared test configuration: placeholder hosts, addresses and secrets."""
 
+from datetime import timedelta
+from pathlib import Path
+
 from shopify_erpnext_connector.config import (
+    DEFAULT_STORE_PATH,
     Config,
     EmailConfig,
     Environment,
     Secret,
     Secrets,
+    WorkerConfig,
 )
 
 SHOP_DOMAIN = "example.myshopify.com"
 LOCATION_ID = "gid://shopify/Location/1234567890"
 ERPNEXT_URL = "https://erpnext.example.com"
+WAREHOUSE = "Stores - TEST"
+POLL_INTERVAL = timedelta(seconds=5)
+PUSH_STALE_AFTER = timedelta(minutes=30)
 ERPNEXT_API_KEY = "test-erpnext-key"
 ERPNEXT_API_SECRET = "test-erpnext-secret"
 SHOPIFY_ACCESS_TOKEN = "test-shopify-token"
@@ -28,11 +36,16 @@ def make_config(
         shop_domain=SHOP_DOMAIN,
         location_id=LOCATION_ID,
         erpnext_url=ERPNEXT_URL,
+        warehouse=WAREHOUSE,
         email=EmailConfig(
             enabled=email_enabled,
             recipient=EMAIL_RECIPIENT,
             sender=EMAIL_SENDER,
         ),
+        worker=WorkerConfig(
+            poll_interval=POLL_INTERVAL, push_stale_after=PUSH_STALE_AFTER
+        ),
+        store_path=Path(DEFAULT_STORE_PATH),
         secrets=Secrets(
             erpnext_api_key=Secret(ERPNEXT_API_KEY),
             erpnext_api_secret=Secret(ERPNEXT_API_SECRET),
