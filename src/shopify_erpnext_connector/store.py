@@ -113,6 +113,15 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE problems ADD COLUMN email_attempts INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE problems ADD COLUMN last_email_attempt_at TEXT;
     """,
+    """
+    -- Operator settings. Dry-run starts on, so a fresh install pushes nothing
+    -- until an operator turns it off.
+    CREATE TABLE settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        dry_run INTEGER NOT NULL CHECK (dry_run IN (0, 1))
+    );
+    INSERT INTO settings (id, dry_run) VALUES (1, 1);
+    """,
 )
 
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
@@ -166,6 +175,15 @@ def purge_push_history(connection: sqlite3.Connection, now: datetime) -> int:
         "DELETE FROM push_history WHERE attempted_at < ?", (cutoff,)
     )
     return cursor.rowcount
+
+
+def dry_run(connection: sqlite3.Connection) -> bool:
+    """Whether the worker computes and records without pushing to Shopify."""
+    return bool(connection.execute("SELECT dry_run FROM settings").fetchone()[0])
+
+
+def set_dry_run(connection: sqlite3.Connection, on: bool) -> None:
+    connection.execute("UPDATE settings SET dry_run = ?", (int(on),))
 
 
 def utc_timestamp(moment: datetime) -> str:

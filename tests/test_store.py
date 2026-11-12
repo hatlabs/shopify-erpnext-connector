@@ -9,9 +9,11 @@ from shopify_erpnext_connector.store import (
     MIGRATIONS,
     PUSH_HISTORY_RETENTION,
     StoreError,
+    dry_run,
     migrate,
     open_store,
     purge_push_history,
+    set_dry_run,
     utc_timestamp,
 )
 
@@ -29,6 +31,7 @@ PHASE_A_TABLES = {
     "decisions",
     "audit_log",
     "sku_changes",
+    "settings",
 }
 
 
@@ -215,3 +218,37 @@ def test_pending_pushes_hold_no_idempotency_key(store: sqlite3.Connection) -> No
     # A batch key is in-memory only; a rebuilt batch relies on change_from.
     columns = {row[1] for row in store.execute("PRAGMA table_info(pending_pushes)")}
     assert columns == {"variant_id", "available", "change_from", "queued_at"}
+
+
+def test_a_fresh_store_is_in_dry_run(store: sqlite3.Connection) -> None:
+    assert dry_run(store) is True
+
+
+def test_dry_run_can_be_turned_off_and_on(store: sqlite3.Connection) -> None:
+    set_dry_run(store, False)
+    assert dry_run(store) is False
+
+    set_dry_run(store, True)
+    assert dry_run(store) is True
+
+
+def test_dry_run_setting_survives_a_restart(db_path: Path) -> None:
+    first = open_store(db_path)
+    set_dry_run(first, False)
+    first.close()
+
+    second = open_store(db_path)
+    assert dry_run(second) is False
+    second.close()
+
+
+def test_a_store_from_before_the_settings_migration_starts_in_dry_run(
+    db_path: Path,
+) -> None:
+    connection = sqlite3.connect(db_path, isolation_level=None)
+    migrate(connection, MIGRATIONS[:3])
+
+    migrate(connection, MIGRATIONS)
+
+    assert dry_run(connection) is True
+    connection.close()
