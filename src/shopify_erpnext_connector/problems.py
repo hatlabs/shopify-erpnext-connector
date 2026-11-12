@@ -132,6 +132,17 @@ def open_problems(connection: sqlite3.Connection) -> list[StoredProblem]:
     return [_stored(row) for row in rows]
 
 
+def count_open_problems(connection: sqlite3.Connection) -> dict[ProblemKind, int]:
+    """Open problems by kind, every kind present."""
+    counts = dict.fromkeys(ProblemKind, 0)
+    rows = connection.execute(
+        "SELECT kind, count(*) FROM problems WHERE resolved_at IS NULL GROUP BY kind"
+    )
+    for kind, count in rows:
+        counts[ProblemKind(kind)] = count
+    return counts
+
+
 def unsent_emails(connection: sqlite3.Connection) -> list[StoredProblem]:
     """Open problems whose current email has not been confirmed Sent."""
     return [problem for problem in open_problems(connection) if problem.email_pending]

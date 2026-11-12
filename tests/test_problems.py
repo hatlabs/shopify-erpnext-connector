@@ -8,6 +8,7 @@ import pytest
 from shopify_erpnext_connector.problems import (
     Problem,
     ProblemKind,
+    count_open_problems,
     count_unsent_emails,
     get_problem,
     open_problems,
@@ -365,3 +366,22 @@ def test_show_command_quotes_a_subject_the_shell_would_split() -> None:
     assert show_command(ProblemKind.AMBIGUOUS_SKU, "SKU WITH SPACE") == (
         "shopify-erpnext-connector problems show 'ambiguous_sku:SKU WITH SPACE'"
     )
+
+
+def test_open_problems_are_counted_by_kind_with_every_kind_present(
+    store: sqlite3.Connection,
+) -> None:
+    record_check(
+        store, ProblemKind.UNBOUND_SKU, [unbound(), unbound(OTHER_VARIANT)], NOW
+    )
+    record_check(
+        store,
+        ProblemKind.OVERSELL,
+        [Problem(ProblemKind.OVERSELL, VARIANT, {"Item": "TEST-ITEM"})],
+        NOW,
+    )
+    record_check(store, ProblemKind.OVERSELL, [], LATER)
+
+    counts = count_open_problems(store)
+
+    assert counts == {kind: 0 for kind in ProblemKind} | {ProblemKind.UNBOUND_SKU: 2}
