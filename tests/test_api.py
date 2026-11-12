@@ -838,6 +838,36 @@ def test_record_for_a_held_variant_keeps_its_last_decision(
     assert body["decision"]["item_code"] == "TEST-ITEM-001"
 
 
+def resolve_unbound(store: sqlite3.Connection, variant_id: str) -> None:
+    """An unbound-SKU problem for the variant, opened and then resolved."""
+    record_check(
+        store,
+        ProblemKind.UNBOUND_SKU,
+        [Problem(ProblemKind.UNBOUND_SKU, variant_id, {"SKU": "TEST-SKU-001"})],
+        NOW,
+    )
+    record_check(store, ProblemKind.UNBOUND_SKU, [], NOW + timedelta(seconds=1))
+
+
+def test_record_skips_a_resolved_binding_problem(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    resolve_unbound(store, VARIANT)
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+
+    body = get_record(client, VARIANT).json()
+
+    assert body["binding_problem"]["key"] == f"changed_sku:{VARIANT}"
+
+
+def test_record_for_a_variant_with_only_a_resolved_problem_is_not_found(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    resolve_unbound(store, VARIANT)
+
+    assert get_record(client, VARIANT).status_code == 404
+
+
 def test_record_ignores_problems_other_than_binding(
     client: httpx.Client, store: sqlite3.Connection
 ) -> None:
