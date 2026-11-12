@@ -842,6 +842,57 @@ def test_record_for_an_unknown_variant_is_not_found(client: httpx.Client) -> Non
     assert VARIANT in response.json()["error"]
 
 
+def test_report_compares_each_computed_bound_variant(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    bind(store, VARIANT, "TEST-ITEM-001")
+    explanation = {
+        "sellable": 3,
+        "old_formula": 4,
+        "actual_qty": 5.0,
+        "reserved_qty": 1.0,
+        "reserved_qty_for_production": 0.0,
+        "planned_qty": 2.0,
+        "unmirrored": 1,
+    }
+    decision = Decision("TEST-ITEM-001", explanation, 4, None, "dry run", None)
+    save_decisions(store, [(VARIANT, decision)], NOW)
+
+    response = client.get("/report", headers=operator())
+
+    assert response.status_code == 200
+    assert response.json()["rows"] == [
+        {
+            "variant_id": VARIANT,
+            "item_code": "TEST-ITEM-001",
+            "shopify_available": 4,
+            "computed": 3,
+            "old_formula": 4,
+            "actual_qty": 5.0,
+            "reserved_qty": 1.0,
+            "reserved_qty_for_production": 0.0,
+            "planned_qty": 2.0,
+            "unmirrored": 1,
+        }
+    ]
+
+
+def test_report_before_any_computation_is_empty(client: httpx.Client) -> None:
+    assert client.get("/report", headers=operator()).json()["rows"] == []
+
+
+@pytest.mark.parametrize(
+    "path", ["/problems", "/problem", "/bindings", "/record", "/report"]
+)
+def test_read_endpoints_take_an_operator_token_for_this_environment(
+    client: httpx.Client, path: str
+) -> None:
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers=operator(METRICS_TOKEN)).status_code == 401
+    production = operator(environment=Environment.PRODUCTION)
+    assert client.get(path, headers=production).status_code == 409
+
+
 def test_record_without_a_variant_is_a_bad_request(client: httpx.Client) -> None:
     response = client.get("/record", headers=operator())
 

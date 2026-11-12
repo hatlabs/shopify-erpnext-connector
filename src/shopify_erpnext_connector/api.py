@@ -36,7 +36,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from shopify_erpnext_connector.bindings import bound_item_code, load_sku_changes
 from shopify_erpnext_connector.config import Config
-from shopify_erpnext_connector.decisions import load_decision
+from shopify_erpnext_connector.decisions import comparison_report, load_decision
 from shopify_erpnext_connector.problems import (
     ProblemKind,
     StoredProblem,
@@ -333,6 +333,10 @@ class ApiServer:
             },
         )
 
+    def report(self, request: _Request) -> _Response:
+        rows = comparison_report(request.connection)
+        return self.json(HTTPStatus.OK, {"rows": [asdict(row) for row in rows]})
+
     def metrics(self, request: _Request) -> _Response:
         connection = request.connection
         now = self._clock()
@@ -412,6 +416,7 @@ _ROUTES: Mapping[str, _Route] = {
     "/problem": _Route("GET", _Access.OPERATOR, ApiServer.problem),
     "/bindings": _Route("GET", _Access.OPERATOR, ApiServer.bindings),
     "/record": _Route("GET", _Access.OPERATOR, ApiServer.record),
+    "/report": _Route("GET", _Access.OPERATOR, ApiServer.report),
 }
 
 
