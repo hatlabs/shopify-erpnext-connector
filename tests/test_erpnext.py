@@ -5,7 +5,13 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from shopify_erpnext_connector.config import Config, Environment, Secret, Secrets
+from shopify_erpnext_connector.config import (
+    Config,
+    EmailConfig,
+    Environment,
+    Secret,
+    Secrets,
+)
 from shopify_erpnext_connector.erpnext import (
     ErpNextClient,
     ErpNextError,
@@ -61,6 +67,11 @@ def make_config(erpnext_url: str = ERPNEXT_URL) -> Config:
         shop_domain="example.myshopify.com",
         location_id="gid://shopify/Location/1234567890",
         erpnext_url=erpnext_url,
+        email=EmailConfig(
+            enabled=False,
+            recipient="operator@example.com",
+            sender="notifications@example.com",
+        ),
         secrets=Secrets(
             erpnext_api_key=Secret(API_KEY),
             erpnext_api_secret=Secret(API_SECRET),

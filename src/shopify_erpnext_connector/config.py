@@ -18,6 +18,7 @@ OPERATOR_TOKEN_PREFIX = "operator_token_"
 _SHOP_DOMAIN = re.compile(r"(?:[a-z0-9-]+\.)+myshopify\.com")
 _LOCATION_ID = re.compile(r"gid://shopify/Location/[0-9]+")
 _OPERATOR_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
+_EMAIL_ADDRESS = re.compile(r"[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+")
 _ERPNEXT_SCHEMES = ("http", "https")
 
 # Allowed field names: None marks a leaf, a mapping a nested table. Values are
@@ -28,6 +29,7 @@ _SCHEMA: _Schema = {
     "operators": None,
     "shopify": {"shop_domain": None, "location_id": None},
     "erpnext": {"url": None},
+    "email": {"enabled": None, "recipient": None, "sender": None},
 }
 
 
@@ -80,11 +82,21 @@ class Secrets:
 
 
 @dataclass(frozen=True)
+class EmailConfig:
+    """Problem emails: staging turns sending off and still records problems."""
+
+    enabled: bool
+    recipient: str
+    sender: str
+
+
+@dataclass(frozen=True)
 class Config:
     environment: Environment
     shop_domain: str
     location_id: str
     erpnext_url: str
+    email: EmailConfig
     secrets: Secrets
 
 
@@ -140,6 +152,11 @@ def load_config(config_path: Path, secrets_dir: Path) -> Config:
         shop_domain=shop_domain,
         location_id=location_id,
         erpnext_url=erpnext_url.rstrip("/"),
+        email=EmailConfig(
+            enabled=document.boolean("email.enabled"),
+            recipient=document.email_address("email.recipient"),
+            sender=document.email_address("email.sender"),
+        ),
         secrets=Secrets.read(secrets_dir, document.operators()),
     )
 
@@ -165,7 +182,7 @@ class _Document:
                     raise self.error(f"'{dotted}' must be a table")
                 self.reject_unknown_fields(value, expected, prefix=dotted + ".")
 
-    def string(self, dotted: str) -> str:
+    def value(self, dotted: str) -> object:
         table: Mapping[str, object] = self.data
         *parents, key = dotted.split(".")
         for parent in parents:
@@ -176,8 +193,24 @@ class _Document:
         value = table.get(key)
         if value is None:
             raise self.error(f"missing required field '{dotted}'")
+        return value
+
+    def string(self, dotted: str) -> str:
+        value = self.value(dotted)
         if not isinstance(value, str) or not value:
             raise self.error(f"'{dotted}' must be a non-empty string")
+        return value
+
+    def boolean(self, dotted: str) -> bool:
+        value = self.value(dotted)
+        if not isinstance(value, bool):
+            raise self.error(f"'{dotted}' must be true or false")
+        return value
+
+    def email_address(self, dotted: str) -> str:
+        value = self.string(dotted)
+        if not _EMAIL_ADDRESS.fullmatch(value):
+            raise self.error(f"'{dotted}' must be a bare email address")
         return value
 
     def operators(self) -> list[str]:

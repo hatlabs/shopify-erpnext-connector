@@ -22,7 +22,13 @@ from shopify_erpnext_connector.bindings import (
     refresh_bindings,
     save_bindings,
 )
-from shopify_erpnext_connector.config import Config, Environment, Secret, Secrets
+from shopify_erpnext_connector.config import (
+    Config,
+    EmailConfig,
+    Environment,
+    Secret,
+    Secrets,
+)
 from shopify_erpnext_connector.erpnext import ErpNextClient, ErpNextError
 from shopify_erpnext_connector.shopify import ShopifyClient, ShopifyError
 from shopify_erpnext_connector.store import open_store, utc_timestamp
@@ -41,6 +47,11 @@ def make_config() -> Config:
         shop_domain=SHOP_DOMAIN,
         location_id="gid://shopify/Location/1234567890",
         erpnext_url=ERPNEXT_URL,
+        email=EmailConfig(
+            enabled=False,
+            recipient="operator@example.com",
+            sender="notifications@example.com",
+        ),
         secrets=Secrets(
             erpnext_api_key=Secret("test-erpnext-key"),
             erpnext_api_secret=Secret("test-erpnext-secret"),
