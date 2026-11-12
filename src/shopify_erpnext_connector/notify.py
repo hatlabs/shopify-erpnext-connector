@@ -124,13 +124,17 @@ KIND_TEXTS: dict[ProblemKind, KindText] = {
     ),
     ProblemKind.STALE_PUSH: KindText(
         title="Stock not pushed to Shopify",
-        subject_label="Shopify variant",
+        subject_label="Shopify location",
         what_is_wrong=(
-            "The connector has not managed to push this variant's stock to "
-            "Shopify in time, so Shopify may show the wrong quantity."
+            "The connector has not managed to push the stock of the listed "
+            "variants to Shopify in time, so Shopify may show wrong quantities "
+            "for them. One email covers all of them; the list and count are "
+            "as of when it was sent and the problem stays open until every "
+            "variant is pushed."
         ),
         what_to_do=(
-            "Check whether Shopify is reachable and what the push history shows."
+            "Check whether Shopify and ERPNext are reachable and what the "
+            "connector's log and the variants' push history show."
         ),
     ),
 }
