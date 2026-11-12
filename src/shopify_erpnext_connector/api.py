@@ -1,10 +1,11 @@
-"""The operator API, served over HTTP from a thread of the connector process.
+"""The operator API and metrics, served over HTTP from a thread of the connector.
 
 Every request carries a bearer token. Operator endpoints take only the
 operator tokens and name the operator by the token that matched; operator
 requests must also name the environment they expect in `ENVIRONMENT_HEADER`,
 so a token copied into the wrong setup cannot act on this one. Every JSON
-response names the connector's environment.
+response names the connector's environment. `/metrics` takes only the
+metrics token and answers in the Prometheus text format, for vmagent.
 
 Each request opens its own store connection: sqlite3 connections are bound
 to the thread that made them, and the store's WAL mode lets them read while
@@ -24,7 +25,7 @@ import threading
 from collections.abc import Callable, Mapping
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import partial
 from http import HTTPStatus
@@ -41,6 +42,10 @@ from shopify_erpnext_connector.worker import dirty_since
 
 ENVIRONMENT_HEADER = "X-Connector-Environment"
 JSON_CONTENT_TYPE = "application/json"
+METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+# No completed pass for this long, counted from start before the first one,
+# reports the pass as stale.
+PASS_STALE_AFTER = timedelta(minutes=5)
 
 # How often the serving loop checks for `close`, so stopping takes at most this.
 SHUTDOWN_POLL_SECONDS = 0.1
@@ -79,6 +84,22 @@ def audit(
 
 class _Access(Enum):
     OPERATOR = "operator"
+    METRICS = "metrics"
+
+
+@dataclass(frozen=True)
+class _Gauge:
+    """A gauge's values by label set, such as `{kind="oversell"}`; "" for none."""
+
+    name: str
+    help: str
+    samples: Mapping[str, float]
+
+    def render(self) -> str:
+        lines = [f"# HELP {self.name} {self.help}", f"# TYPE {self.name} gauge"]
+        for labels, value in self.samples.items():
+            lines.append(f"{self.name}{labels} {value}")
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -115,6 +136,7 @@ class ApiServer:
         self._config = config
         self._worker = worker
         self._clock = clock
+        self._started_at = clock()
         self._http = ThreadingHTTPServer(("", config.api.port), partial(_Handler, self))
         self._thread = threading.Thread(
             target=self._http.serve_forever,
@@ -155,6 +177,12 @@ class ApiServer:
                 matched = name
         return matched
 
+    def is_metrics_token(self, authorization: str | None) -> bool:
+        presented = _bearer_token(authorization)
+        return presented is not None and hmac.compare_digest(
+            presented, self._config.secrets.metrics_token.reveal().encode()
+        )
+
     def wrong_environment(self, requested: str | None) -> str | None:
         """Why a request for `requested` is refused, or None if it is not."""
         serving = self._config.environment
@@ -189,6 +217,62 @@ class ApiServer:
             },
         )
 
+    def metrics(self, request: _Request) -> _Response:
+        connection = request.connection
+        now = self._clock()
+        last_pass_at = self._worker.last_pass_at
+        stale_since = self._started_at if last_pass_at is None else last_pass_at
+        gauges = [
+            _Gauge(
+                "connector_info",
+                "Always 1; the environment label names the connector's environment.",
+                {f'{{environment="{self._config.environment}"}}': 1},
+            ),
+            _Gauge(
+                "connector_last_pass_timestamp_seconds",
+                "Start of the last completed pass, in Unix time; 0 before the first.",
+                {"": 0 if last_pass_at is None else last_pass_at.timestamp()},
+            ),
+            _Gauge(
+                "connector_last_pass_full",
+                "1 if the last completed pass was a full pass, else 0.",
+                {"": int(self._worker.last_pass_full)},
+            ),
+            _Gauge(
+                "connector_pass_stale",
+                "1 if no pass completed in the last "
+                f"{PASS_STALE_AFTER.total_seconds():g} seconds, counted from "
+                "start before the first pass, else 0.",
+                {"": int(now - stale_since >= PASS_STALE_AFTER)},
+            ),
+            _Gauge(
+                "connector_push_lag_seconds",
+                "Age of the oldest value waiting to be pushed to Shopify; "
+                "0 if none waits.",
+                {"": self._push_lag(connection)},
+            ),
+            _Gauge(
+                "connector_open_problems",
+                "Open problems by kind.",
+                {
+                    f'{{kind="{kind}"}}': count
+                    for kind, count in count_open_problems(connection).items()
+                },
+            ),
+            _Gauge(
+                "connector_unsent_emails",
+                "Open problems whose email has not been confirmed sent.",
+                {"": count_unsent_emails(connection)},
+            ),
+            _Gauge(
+                "connector_dry_run",
+                "1 if the connector pushes nothing to Shopify, else 0.",
+                {"": int(dry_run(connection))},
+            ),
+        ]
+        text = "\n".join(gauge.render() for gauge in gauges) + "\n"
+        return _Response(HTTPStatus.OK, text.encode(), METRICS_CONTENT_TYPE)
+
     def _push_lag(self, connection: sqlite3.Connection) -> float:
         """Seconds the oldest value not yet pushed has waited; 0 if none waits."""
         since = unpushed_since(connection, dirty_since(connection))
@@ -200,6 +284,7 @@ class ApiServer:
 
 _ROUTES: Mapping[str, _Route] = {
     "/status": _Route("GET", _Access.OPERATOR, ApiServer.status),
+    "/metrics": _Route("GET", _Access.METRICS, ApiServer.metrics),
 }
 
 
@@ -226,12 +311,9 @@ class _Handler(BaseHTTPRequestHandler):
         super().__init__(request, client_address, server)
 
     def do_GET(self) -> None:
-        self._dispatch()
+        self._send(self._respond())
 
     do_POST = do_PUT = do_PATCH = do_DELETE = do_GET
-
-    def _dispatch(self) -> None:
-        self._send(self._respond())
 
     def _respond(self) -> _Response:
         api = self._api
@@ -247,8 +329,13 @@ class _Handler(BaseHTTPRequestHandler):
             return _Response(
                 response.status, response.body, headers={"Allow": route.method}
             )
-        self._operator = api.operator(self.headers.get("Authorization"))
-        if self._operator is None:
+        authorization = self.headers.get("Authorization")
+        if route.access is _Access.METRICS:
+            allowed = api.is_metrics_token(authorization)
+        else:
+            self._operator = api.operator(authorization)
+            allowed = self._operator is not None
+        if not allowed:
             _log.warning(
                 "rejected %s %s from %s: no valid %s token",
                 self.command,
@@ -260,9 +347,10 @@ class _Handler(BaseHTTPRequestHandler):
                 HTTPStatus.UNAUTHORIZED,
                 f"a valid {route.access.value} bearer token is required",
             )
-        refusal = api.wrong_environment(self.headers.get(ENVIRONMENT_HEADER))
-        if refusal is not None:
-            return api.error(HTTPStatus.CONFLICT, refusal)
+        if route.access is _Access.OPERATOR:
+            refusal = api.wrong_environment(self.headers.get(ENVIRONMENT_HEADER))
+            if refusal is not None:
+                return api.error(HTTPStatus.CONFLICT, refusal)
         try:
             with closing(api.connect()) as connection:
                 return route.handle(api, _Request(connection, self._operator))
