@@ -4,12 +4,14 @@ import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from pathlib import Path
 
 import httpx
 import pytest
 from helpers import make_config
 
+from shopify_erpnext_connector import api
 from shopify_erpnext_connector.api import (
     ENVIRONMENT_HEADER,
     METRICS_CONTENT_TYPE,
@@ -336,6 +338,21 @@ def test_store_that_cannot_be_read_is_a_server_error(
     assert response.json()["environment"] == "staging"
     assert any(r.levelno == logging.ERROR for r in logs.records)
     assert not store_path.exists()
+
+
+def test_read_handlers_see_one_snapshot_of_the_store(
+    client: httpx.Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def probe(server: ApiServer, request: api._Request) -> api._Response:
+        in_transaction = request.connection.in_transaction
+        return server.json(HTTPStatus.OK, {"in_transaction": in_transaction})
+
+    route = api._Route("GET", api._Access.OPERATOR, probe)
+    monkeypatch.setitem(api._ROUTES, "/probe", route)
+
+    response = client.get("/probe", headers=operator())
+
+    assert response.json()["in_transaction"] is True
 
 
 def metrics(client: httpx.Client) -> dict[str, float]:

@@ -508,7 +508,16 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             with closing(api.connect()) as connection:
                 query = dict(parse_qsl(url.query))
-                return route.handle(api, _Request(connection, self._operator, query))
+                request = _Request(connection, self._operator, query)
+                if route.method != "GET":
+                    return route.handle(api, request)
+                # One read transaction, so every statement of the handler sees
+                # the same WAL snapshot even while the worker commits a pass.
+                connection.execute("BEGIN")
+                try:
+                    return route.handle(api, request)
+                finally:
+                    connection.rollback()
         except Exception:
             # The operator gets a JSON answer; the details go to the log only.
             _log.exception("%s %s failed", self.command, path)
