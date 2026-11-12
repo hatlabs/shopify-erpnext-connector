@@ -47,15 +47,17 @@ MIGRATIONS: tuple[str, ...] = (
         last_pushed_at TEXT
     );
 
-    -- One row per variant: a newer value replaces an unsent one.
+    -- One row per variant: a newer value replaces an unsent one. No idempotency
+    -- key: a batch's key lives only in memory for an immediate resend, and a
+    -- batch rebuilt after a restart is guarded by `change_from` instead.
     CREATE TABLE pending_pushes (
         variant_id TEXT PRIMARY KEY,
         available INTEGER NOT NULL,
         change_from INTEGER,
-        idempotency_key TEXT NOT NULL,
         queued_at TEXT NOT NULL
     );
 
+    -- `idempotency_key` is the key of the batch the row was sent in, for diagnosis.
     CREATE TABLE push_history (
         id INTEGER PRIMARY KEY,
         variant_id TEXT NOT NULL,

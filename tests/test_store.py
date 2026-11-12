@@ -188,3 +188,9 @@ def test_utc_timestamp_converts_to_utc_with_fixed_width() -> None:
 def test_utc_timestamp_refuses_a_naive_datetime() -> None:
     with pytest.raises(ValueError):
         utc_timestamp(datetime(2026, 11, 12, 10, 0))
+
+
+def test_pending_pushes_hold_no_idempotency_key(store: sqlite3.Connection) -> None:
+    # A batch key is in-memory only; a rebuilt batch relies on change_from.
+    columns = {row[1] for row in store.execute("PRAGMA table_info(pending_pushes)")}
+    assert columns == {"variant_id", "available", "change_from", "queued_at"}
