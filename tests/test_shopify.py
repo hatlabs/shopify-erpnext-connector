@@ -4,14 +4,8 @@ from collections.abc import Callable, Mapping
 
 import httpx
 import pytest
+from helpers import LOCATION_ID, SHOP_DOMAIN, SHOPIFY_ACCESS_TOKEN, make_config
 
-from shopify_erpnext_connector.config import (
-    Config,
-    EmailConfig,
-    Environment,
-    Secret,
-    Secrets,
-)
 from shopify_erpnext_connector.pinning import PinningError
 from shopify_erpnext_connector.retry import MAX_ATTEMPTS, RETRY_DELAY_SECONDS
 from shopify_erpnext_connector.shopify import (
@@ -29,35 +23,11 @@ from shopify_erpnext_connector.shopify import (
     batch_changes,
 )
 
-SHOP_DOMAIN = "example.myshopify.com"
-LOCATION_ID = "gid://shopify/Location/1234567890"
-ACCESS_TOKEN = "test-shopify-token"
 GRAPHQL_PATH = f"/admin/api/{API_VERSION}/graphql.json"
 MAXIMUM_POINTS = 2000.0
 RESTORE_RATE = 100.0
 
 Handler = Callable[[httpx.Request], httpx.Response]
-
-
-def make_config() -> Config:
-    return Config(
-        environment=Environment.STAGING,
-        shop_domain=SHOP_DOMAIN,
-        location_id=LOCATION_ID,
-        erpnext_url="https://erpnext.example.com",
-        email=EmailConfig(
-            enabled=False,
-            recipient="operator@example.com",
-            sender="notifications@example.com",
-        ),
-        secrets=Secrets(
-            erpnext_api_key=Secret("test-erpnext-key"),
-            erpnext_api_secret=Secret("test-erpnext-secret"),
-            shopify_access_token=Secret(ACCESS_TOKEN),
-            metrics_token=Secret("test-metrics-token"),
-            operator_tokens={},
-        ),
-    )
 
 
 def cost(requested: float, available: float) -> dict[str, object]:
@@ -193,7 +163,7 @@ def test_execute_posts_to_the_pinned_api_version_with_the_token() -> None:
     assert request.method == "POST"
     assert request.url.host == SHOP_DOMAIN
     assert request.url.path == GRAPHQL_PATH
-    assert request.headers.get("X-Shopify-Access-Token") == ACCESS_TOKEN
+    assert request.headers.get("X-Shopify-Access-Token") == SHOPIFY_ACCESS_TOKEN
     assert recorder.bodies()[0] == {
         "query": "query Shop($first: Int!) { shop { name } }",
         "variables": {"first": 1},
@@ -598,7 +568,7 @@ def test_logs_and_errors_carry_no_token_or_body(
 
     texts = [caplog.text, str(user_excinfo.value), str(http_excinfo.value)]
     for text in texts:
-        assert ACCESS_TOKEN not in text
+        assert SHOPIFY_ACCESS_TOKEN not in text
         assert "synthetic server detail" not in text
         assert "InventoryItem/1001" not in text
         assert batch.idempotency_key not in text

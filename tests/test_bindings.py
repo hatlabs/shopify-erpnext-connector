@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from helpers import ERPNEXT_URL, SHOP_DOMAIN, make_config
 
 from shopify_erpnext_connector.bindings import (
     VARIANT_PAGE_SIZE,
@@ -22,44 +23,14 @@ from shopify_erpnext_connector.bindings import (
     refresh_bindings,
     save_bindings,
 )
-from shopify_erpnext_connector.config import (
-    Config,
-    EmailConfig,
-    Environment,
-    Secret,
-    Secrets,
-)
 from shopify_erpnext_connector.erpnext import ErpNextClient, ErpNextError
 from shopify_erpnext_connector.shopify import ShopifyClient, ShopifyError
 from shopify_erpnext_connector.store import open_store, utc_timestamp
 
-SHOP_DOMAIN = "example.myshopify.com"
-ERPNEXT_URL = "https://erpnext.example.com"
 NOW = datetime(2026, 11, 12, 10, 0, tzinfo=UTC)
 LATER = NOW + timedelta(hours=1)
 
 Handler = Callable[[httpx.Request], httpx.Response]
-
-
-def make_config() -> Config:
-    return Config(
-        environment=Environment.STAGING,
-        shop_domain=SHOP_DOMAIN,
-        location_id="gid://shopify/Location/1234567890",
-        erpnext_url=ERPNEXT_URL,
-        email=EmailConfig(
-            enabled=False,
-            recipient="operator@example.com",
-            sender="notifications@example.com",
-        ),
-        secrets=Secrets(
-            erpnext_api_key=Secret("test-erpnext-key"),
-            erpnext_api_secret=Secret("test-erpnext-secret"),
-            shopify_access_token=Secret("test-shopify-token"),
-            metrics_token=Secret("test-metrics-token"),
-            operator_tokens={},
-        ),
-    )
 
 
 def variant(

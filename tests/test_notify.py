@@ -6,14 +6,9 @@ from pathlib import Path
 
 import httpx
 import pytest
+from helpers import EMAIL_RECIPIENT, EMAIL_SENDER, ERPNEXT_URL, make_config
 
-from shopify_erpnext_connector.config import (
-    Config,
-    EmailConfig,
-    Environment,
-    Secret,
-    Secrets,
-)
+from shopify_erpnext_connector.config import Config, Environment
 from shopify_erpnext_connector.erpnext import MAX_ATTEMPTS, ErpNextClient
 from shopify_erpnext_connector.notify import (
     EMAIL_RETRY_INTERVAL,
@@ -31,32 +26,12 @@ from shopify_erpnext_connector.problems import (
 )
 from shopify_erpnext_connector.store import open_store
 
-ERPNEXT_URL = "https://erpnext.example.com"
-RECIPIENT = "operator@example.com"
-SENDER = "notifications@example.com"
 NOW = datetime(2026, 11, 12, 10, 0, tzinfo=UTC)
 VARIANT = "gid://shopify/ProductVariant/1001"
 OTHER_VARIANT = "gid://shopify/ProductVariant/1002"
 SHOW_COMMAND = f"shopify-erpnext-connector problems show unbound_sku:{VARIANT}"
 ONE_SECOND = timedelta(seconds=1)
 COMMUNICATION_PATH = "/api/resource/Communication"
-
-
-def make_config(*, enabled: bool = True) -> Config:
-    return Config(
-        environment=Environment.PRODUCTION,
-        shop_domain="example.myshopify.com",
-        location_id="gid://shopify/Location/1234567890",
-        erpnext_url=ERPNEXT_URL,
-        email=EmailConfig(enabled=enabled, recipient=RECIPIENT, sender=SENDER),
-        secrets=Secrets(
-            erpnext_api_key=Secret("test-erpnext-key"),
-            erpnext_api_secret=Secret("test-erpnext-secret"),
-            shopify_access_token=Secret("test-shopify-token"),
-            metrics_token=Secret("test-metrics-token"),
-            operator_tokens={},
-        ),
-    )
 
 
 class FakeErpNext:
@@ -146,7 +121,9 @@ def run_pass(
     config: Config | None = None,
     now: datetime = NOW,
 ) -> None:
-    config = config or make_config()
+    config = config or make_config(
+        environment=Environment.PRODUCTION, email_enabled=True
+    )
     record_check(store, kind, found, now)
     http = httpx.Client(base_url=ERPNEXT_URL, transport=httpx.MockTransport(erpnext))
     client = ErpNextClient(config, http, sleep=lambda _: None)
@@ -171,8 +148,8 @@ def test_new_problem_sends_one_email_with_the_cli_command(
     run_pass(store, erpnext, [unbound()])
 
     (call,) = erpnext.make_calls
-    assert call["recipients"] == RECIPIENT
-    assert call["sender"] == SENDER
+    assert call["recipients"] == EMAIL_RECIPIENT
+    assert call["sender"] == EMAIL_SENDER
     assert call["send_email"] == 1
     assert call["communication_medium"] == "Email"
     assert call["sent_or_received"] == "Sent"
@@ -399,7 +376,12 @@ def test_attempts_survive_a_restart(db_path: Path, erpnext: FakeErpNext) -> None
 def test_sending_disabled_records_the_problem_without_calling_erpnext(
     store: sqlite3.Connection, erpnext: FakeErpNext
 ) -> None:
-    run_pass(store, erpnext, [unbound()], config=make_config(enabled=False))
+    run_pass(
+        store,
+        erpnext,
+        [unbound()],
+        config=make_config(environment=Environment.PRODUCTION),
+    )
 
     assert erpnext.requests == []
     assert is_pending(store)
@@ -409,7 +391,7 @@ def test_sending_disabled_records_the_problem_without_calling_erpnext(
 def test_resolved_problem_is_not_sent(
     store: sqlite3.Connection, erpnext: FakeErpNext
 ) -> None:
-    disabled = make_config(enabled=False)
+    disabled = make_config(environment=Environment.PRODUCTION)
     run_pass(store, erpnext, [unbound()], config=disabled)
 
     run_pass(store, erpnext, [])

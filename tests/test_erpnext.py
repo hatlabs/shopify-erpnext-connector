@@ -4,14 +4,8 @@ from collections.abc import Callable
 
 import httpx
 import pytest
+from helpers import ERPNEXT_API_KEY, ERPNEXT_API_SECRET, ERPNEXT_URL, make_config
 
-from shopify_erpnext_connector.config import (
-    Config,
-    EmailConfig,
-    Environment,
-    Secret,
-    Secrets,
-)
 from shopify_erpnext_connector.erpnext import (
     ErpNextClient,
     ErpNextError,
@@ -22,10 +16,6 @@ from shopify_erpnext_connector.erpnext import (
 )
 from shopify_erpnext_connector.pinning import PinningError
 from shopify_erpnext_connector.retry import MAX_ATTEMPTS
-
-ERPNEXT_URL = "https://erpnext.example.com"
-API_KEY = "test-erpnext-key"
-API_SECRET = "test-erpnext-secret"
 
 # Recorded Bin rows, scrubbed: synthetic item codes and warehouse, quantities only.
 BIN_ROWS = [
@@ -59,27 +49,6 @@ FORBIDDEN_BODY = {
 SERVER_ERROR_BODY = {"exc_type": "Exception", "exception": "synthetic failure detail"}
 
 Handler = Callable[[httpx.Request], httpx.Response]
-
-
-def make_config(erpnext_url: str = ERPNEXT_URL) -> Config:
-    return Config(
-        environment=Environment.STAGING,
-        shop_domain="example.myshopify.com",
-        location_id="gid://shopify/Location/1234567890",
-        erpnext_url=erpnext_url,
-        email=EmailConfig(
-            enabled=False,
-            recipient="operator@example.com",
-            sender="notifications@example.com",
-        ),
-        secrets=Secrets(
-            erpnext_api_key=Secret(API_KEY),
-            erpnext_api_secret=Secret(API_SECRET),
-            shopify_access_token=Secret("test-shopify-token"),
-            metrics_token=Secret("test-metrics-token"),
-            operator_tokens={},
-        ),
-    )
 
 
 class Recorder:
@@ -155,7 +124,7 @@ def test_requests_carry_token_auth() -> None:
     recorder = Recorder(httpx.Response(200, json={"data": []}))
     make_client(recorder).get_list("Bin", fields=["name"])
 
-    expected = f"token {API_KEY}:{API_SECRET}"
+    expected = f"token {ERPNEXT_API_KEY}:{ERPNEXT_API_SECRET}"
     assert recorder.requests[0].headers.get("Authorization") == expected
 
 
@@ -303,8 +272,8 @@ def test_failed_request_with_retries_logs_no_token_header_or_body(
 
     logged = caplog.text + "".join(str(r.args) for r in caplog.records)
     for forbidden in (
-        API_KEY,
-        API_SECRET,
+        ERPNEXT_API_KEY,
+        ERPNEXT_API_SECRET,
         "token ",
         "synthetic failure detail",
         "TEST-ITEM-001",
