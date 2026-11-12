@@ -266,7 +266,7 @@ class Worker:
                     now,
                     self._config.worker.push_stale_after,
                     location_id=self._config.location_id,
-                    waiting_since=_dirty_since(connection),
+                    waiting_since=dirty_since(connection),
                 )
                 record_check(
                     connection,
@@ -560,7 +560,7 @@ def _binding_details(variant: UnboundVariant) -> dict[str, str]:
     return details
 
 
-def _dirty_since(connection: sqlite3.Connection) -> dict[str, str]:
+def dirty_since(connection: sqlite3.Connection) -> dict[str, str]:
     """When each bound variant's item was marked dirty, by variant ID."""
     dirty = dirty_items(connection)
     return {
