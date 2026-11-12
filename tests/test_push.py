@@ -1,12 +1,34 @@
 import json
-from collections.abc import Callable, Mapping
+import sqlite3
+from collections.abc import Callable, Iterator, Mapping
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
 from helpers import LOCATION_ID, SHOP_DOMAIN, make_config
 
-from shopify_erpnext_connector.push import LEVELS_PAGE_SIZE, Level, fetch_levels
-from shopify_erpnext_connector.shopify import ShopifyClient, ShopifyError
+from shopify_erpnext_connector.push import (
+    LEVELS_PAGE_SIZE,
+    TRANSPORT_FAILURE,
+    Level,
+    PushOutcome,
+    PushTarget,
+    drop_unbound_pending,
+    fetch_levels,
+    last_pushed_values,
+    push,
+)
+from shopify_erpnext_connector.shopify import (
+    BATCH_LIMIT,
+    CHANGE_FROM_QUANTITY_STALE,
+    ShopifyClient,
+    ShopifyError,
+)
+from shopify_erpnext_connector.store import open_store, utc_timestamp
+
+NOW = datetime(2026, 11, 12, 10, 0, tzinfo=UTC)
+LATER = NOW + timedelta(minutes=5)
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -41,6 +63,59 @@ def shopify_client(handler: Handler) -> ShopifyClient:
 
 def graphql(data: Mapping[str, object]) -> httpx.Response:
     return httpx.Response(200, json={"data": data})
+
+
+class TimeOut:
+    """Stands in for a response: the request times out instead."""
+
+
+Step = httpx.Response | TimeOut
+SentEntry = tuple[str, int, int | None]
+
+
+class Shopify:
+    """Answers each request with the next step and records the request."""
+
+    def __init__(self, *steps: Step) -> None:
+        self.steps = list(steps)
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        step = self.steps.pop(0)
+        if isinstance(step, TimeOut):
+            raise httpx.ReadTimeout("synthetic timeout", request=request)
+        return step
+
+    def client(self) -> ShopifyClient:
+        return shopify_client(self)
+
+    def mutations(self) -> list[dict[str, object]]:
+        """The variables of each inventory mutation sent."""
+        found: list[dict[str, object]] = []
+        for request in self.requests:
+            variables = json.loads(request.content)["variables"]
+            assert isinstance(variables, dict)
+            if "input" in variables:
+                found.append(variables)
+        return found
+
+    def keys(self) -> list[str]:
+        return [str(m["idempotencyKey"]) for m in self.mutations()]
+
+    def sent(self) -> list[list[SentEntry]]:
+        """Per mutation: (inventory item, quantity, changeFromQuantity) entries."""
+        batches: list[list[SentEntry]] = []
+        for variables in self.mutations():
+            mutation_input = variables["input"]
+            assert isinstance(mutation_input, dict)
+            batches.append(
+                [
+                    (q["inventoryItemId"], q["quantity"], q["changeFromQuantity"])
+                    for q in mutation_input["quantities"]
+                ]
+            )
+        return batches
 
 
 def inventory_item_id(n: int) -> str:
@@ -177,3 +252,511 @@ def test_malformed_levels_response_raises(data: dict[str, object]) -> None:
 
     with pytest.raises(ShopifyError):
         fetch_levels(shopify_client(recorder), [inventory_item_id(1)], LOCATION_ID)
+
+
+# Pushing
+
+
+def variant_id(n: int) -> str:
+    return f"gid://shopify/ProductVariant/{n}"
+
+
+def target(n: int, value: int, current: int | None) -> PushTarget:
+    return PushTarget(
+        variant_id=variant_id(n),
+        inventory_item_id=inventory_item_id(n),
+        value=value,
+        current=current,
+    )
+
+
+def applied() -> httpx.Response:
+    return graphql(
+        {
+            "inventorySetQuantities": {
+                "inventoryAdjustmentGroup": {
+                    "id": "gid://shopify/InventoryAdjustmentGroup/1"
+                },
+                "userErrors": [],
+            }
+        }
+    )
+
+
+def rejected(*errors: tuple[str, list[str]]) -> httpx.Response:
+    # Recorded shape: on any user error the group is null and nothing is applied.
+    return graphql(
+        {
+            "inventorySetQuantities": {
+                "inventoryAdjustmentGroup": None,
+                "userErrors": [
+                    {
+                        "code": code,
+                        "field": field,
+                        "message": "synthetic user error message",
+                    }
+                    for code, field in errors
+                ],
+            }
+        }
+    )
+
+
+def at_entry(index: int) -> list[str]:
+    return ["input", "quantities", str(index), "changeFromQuantity"]
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+    connection = open_store(tmp_path / "connector.sqlite3")
+    yield connection
+    connection.close()
+
+
+def pending(store: sqlite3.Connection) -> list[tuple[str, int, int | None, str]]:
+    return store.execute(
+        "SELECT variant_id, available, change_from, queued_at"
+        " FROM pending_pushes ORDER BY variant_id"
+    ).fetchall()
+
+
+def quantities(
+    store: sqlite3.Connection,
+) -> list[tuple[str, int | None, str | None, int | None, str | None]]:
+    return store.execute(
+        "SELECT variant_id, last_read, last_read_at, last_pushed, last_pushed_at"
+        " FROM variant_quantities ORDER BY variant_id"
+    ).fetchall()
+
+
+def history(
+    store: sqlite3.Connection,
+) -> list[tuple[str, int, int | None, str, str, str]]:
+    return store.execute(
+        "SELECT variant_id, available, change_from, idempotency_key, attempted_at,"
+        " outcome FROM push_history ORDER BY id"
+    ).fetchall()
+
+
+def test_value_equal_to_shopifys_is_not_pushed(store: sqlite3.Connection) -> None:
+    shopify = Shopify()
+    store.execute(
+        "INSERT INTO pending_pushes VALUES (?, 4, 2, ?)",
+        (variant_id(1), utc_timestamp(NOW)),
+    )
+
+    result = push(store, shopify.client(), LOCATION_ID, [target(1, 4, 4)], LATER)
+
+    assert result.outcomes == {variant_id(1): PushOutcome.UNCHANGED}
+    assert shopify.requests == []
+    assert pending(store) == []
+    stamp = utc_timestamp(LATER)
+    assert quantities(store) == [(variant_id(1), 4, stamp, 4, stamp)]
+    assert history(store) == []
+
+
+def test_differing_value_is_pushed_against_the_level_read(
+    store: sqlite3.Connection,
+) -> None:
+    shopify = Shopify(applied())
+
+    result = push(store, shopify.client(), LOCATION_ID, [target(1, 7, 4)], NOW)
+
+    assert result.outcomes == {variant_id(1): PushOutcome.PUSHED}
+    assert result.codes == {}
+    assert shopify.sent() == [[(inventory_item_id(1), 7, 4)]]
+    mutation_input = shopify.mutations()[0]["input"]
+    assert isinstance(mutation_input, dict)
+    assert mutation_input["quantities"][0]["locationId"] == LOCATION_ID
+    stamp = utc_timestamp(NOW)
+    assert pending(store) == []
+    assert quantities(store) == [(variant_id(1), 4, stamp, 7, stamp)]
+    assert history(store) == [(variant_id(1), 7, 4, shopify.keys()[0], stamp, "pushed")]
+
+
+def test_unchanged_variant_records_the_value_as_confirmed(
+    store: sqlite3.Connection,
+) -> None:
+    push(store, Shopify().client(), LOCATION_ID, [target(1, 7, 7)], LATER)
+
+    stamp = utc_timestamp(LATER)
+    assert quantities(store) == [(variant_id(1), 7, stamp, 7, stamp)]
+
+
+def test_item_without_a_level_is_not_pushed_and_stays_pending(
+    store: sqlite3.Connection,
+) -> None:
+    shopify = Shopify()
+
+    result = push(store, shopify.client(), LOCATION_ID, [target(1, 3, None)], NOW)
+
+    assert result.outcomes == {variant_id(1): PushOutcome.NO_LEVEL}
+    assert shopify.requests == []
+    assert pending(store) == [(variant_id(1), 3, None, utc_timestamp(NOW))]
+    assert history(store) == []
+
+
+def test_no_targets_send_nothing(store: sqlite3.Connection) -> None:
+    shopify = Shopify()
+
+    result = push(store, shopify.client(), LOCATION_ID, [], NOW)
+
+    assert result.outcomes == {}
+    assert shopify.requests == []
+
+
+def test_a_variant_listed_twice_is_refused(store: sqlite3.Connection) -> None:
+    with pytest.raises(ValueError, match="ProductVariant/1"):
+        push(
+            store,
+            Shopify().client(),
+            LOCATION_ID,
+            [target(1, 3, 2), target(1, 4, 2)],
+            NOW,
+        )
+
+
+def test_stale_entry_is_dropped_and_the_rest_resent_under_a_new_key(
+    store: sqlite3.Connection,
+) -> None:
+    shopify = Shopify(
+        rejected((CHANGE_FROM_QUANTITY_STALE, at_entry(1))),
+        applied(),
+    )
+    targets = [target(1, 5, 1), target(2, 6, 2), target(3, 7, 3)]
+
+    result = push(store, shopify.client(), LOCATION_ID, targets, NOW)
+
+    assert result.outcomes == {
+        variant_id(1): PushOutcome.PUSHED,
+        variant_id(2): PushOutcome.STALE,
+        variant_id(3): PushOutcome.PUSHED,
+    }
+    assert result.codes == {variant_id(2): CHANGE_FROM_QUANTITY_STALE}
+    assert shopify.sent() == [
+        [
+            (inventory_item_id(1), 5, 1),
+            (inventory_item_id(2), 6, 2),
+            (inventory_item_id(3), 7, 3),
+        ],
+        [(inventory_item_id(1), 5, 1), (inventory_item_id(3), 7, 3)],
+    ]
+    first, second = shopify.keys()
+    assert first != second
+    stamp = utc_timestamp(NOW)
+    assert pending(store) == [(variant_id(2), 6, 2, stamp)]
+    assert history(store) == [
+        (variant_id(2), 6, 2, first, stamp, "stale"),
+        (variant_id(1), 5, 1, second, stamp, "pushed"),
+        (variant_id(3), 7, 3, second, stamp, "pushed"),
+    ]
+
+
+def test_entry_with_another_user_error_fails_and_the_rest_is_resent(
+    store: sqlite3.Connection,
+) -> None:
+    shopify = Shopify(
+        rejected(("INVALID_INVENTORY_ITEM", at_entry(1))),
+        applied(),
+    )
+    targets = [target(1, 5, 1), target(2, 6, 2), target(3, 7, 3)]
+
+    result = push(store, shopify.client(), LOCATION_ID, targets, NOW)
+
+    assert result.outcomes == {
+        variant_id(1): PushOutcome.PUSHED,
+        variant_id(2): PushOutcome.FAILED,
+        variant_id(3): PushOutcome.PUSHED,
+    }
+    assert result.codes == {variant_id(2): "INVALID_INVENTORY_ITEM"}
+    assert shopify.sent()[1] == [
+        (inventory_item_id(1), 5, 1),
+        (inventory_item_id(3), 7, 3),
+    ]
+    assert pending(store) == [(variant_id(2), 6, 2, utc_timestamp(NOW))]
+    assert history(store)[0][5] == "failed"
+
+
+@pytest.mark.parametrize("stale_first", [True, False])
+def test_entry_both_stale_and_otherwise_rejected_fails_with_the_other_code(
+    store: sqlite3.Connection, stale_first: bool
+) -> None:
+    errors = [
+        (CHANGE_FROM_QUANTITY_STALE, at_entry(0)),
+        ("INVALID_INVENTORY_ITEM", at_entry(0)),
+    ]
+    shopify = Shopify(rejected(*(errors if stale_first else errors[::-1])))
+
+    result = push(store, shopify.client(), LOCATION_ID, [target(1, 5, 1)], NOW)
+
+    assert result.outcomes == {variant_id(1): PushOutcome.FAILED}
+    assert result.codes == {variant_id(1): "INVALID_INVENTORY_ITEM"}
+
+
+def test_rejections_over_several_rounds_each_use_a_new_key(
+    store: sqlite3.Connection,
+) -> None:
+    # Whether Shopify names every bad entry at once is unverified, so a
+    # resend may be rejected for another entry.
+    shopify = Shopify(
+        rejected((CHANGE_FROM_QUANTITY_STALE, at_entry(0))),
+        rejected(("INVALID_INVENTORY_ITEM", at_entry(1))),
+        applied(),
+    )
+    targets = [target(1, 5, 1), target(2, 6, 2), target(3, 7, 3)]
+
+    result = push(store, shopify.client(), LOCATION_ID, targets, NOW)
+
+    assert result.outcomes == {
+        variant_id(1): PushOutcome.STALE,
+        variant_id(2): PushOutcome.PUSHED,
+        variant_id(3): PushOutcome.FAILED,
+    }
+    assert shopify.sent()[2] == [(inventory_item_id(2), 6, 2)]
+    assert len(set(shopify.keys())) == len(shopify.requests)
+
+
+def test_every_entry_rejected_sends_nothing_more(store: sqlite3.Connection) -> None:
+    shopify = Shopify(
+        rejected(
+            (CHANGE_FROM_QUANTITY_STALE, at_entry(0)),
+            (CHANGE_FROM_QUANTITY_STALE, at_entry(1)),
+        )
+    )
+
+    result = push(
+        store, shopify.client(), LOCATION_ID, [target(1, 5, 1), target(2, 6, 2)], NOW
+    )
+
+    assert set(result.outcomes.values()) == {PushOutcome.STALE}
+    assert len(shopify.requests) == 1
+
+
+def test_user_error_naming_no_entry_fails_the_whole_batch(
+    store: sqlite3.Connection,
+) -> None:
+    shopify = Shopify(
+        rejected(
+            (CHANGE_FROM_QUANTITY_STALE, at_entry(0)),
+            ("INVALID_LOCATION", ["input"]),
+        )
+    )
+
+    result = push(
+        store, shopify.client(), LOCATION_ID, [target(1, 5, 1), target(2, 6, 2)], NOW
+    )
+
+    assert result.outcomes == {
+        variant_id(1): PushOutcome.FAILED,
+        variant_id(2): PushOutcome.FAILED,
+    }
+    assert result.codes == {
+        variant_id(1): "INVALID_LOCATION",
+        variant_id(2): "INVALID_LOCATION",
+    }
+    assert len(shopify.requests) == 1
+    assert [row[0] for row in pending(store)] == [variant_id(1), variant_id(2)]
+    assert [row[5] for row in history(store)] == ["failed", "failed"]
+
+
+def test_transport_error_resends_the_same_batch_with_the_same_key(
+    store: sqlite3.Connection,
+) -> None:
+    shopify = Shopify(TimeOut(), applied())
+
+    result = push(store, shopify.client(), LOCATION_ID, [target(1, 7, 4)], NOW)
+
+    assert result.outcomes == {variant_id(1): PushOutcome.PUSHED}
+    first, second = shopify.keys()
+    assert first == second
+    assert shopify.sent()[0] == shopify.sent()[1]
+    assert pending(store) == []
+    assert history(store) == [
+        (variant_id(1), 7, 4, first, utc_timestamp(NOW), "pushed")
+    ]
+
+
+def test_two_transport_errors_fail_the_batch_and_keep_it_pending(
+    store: sqlite3.Connection,
+) -> None:
+    shopify = Shopify(TimeOut(), TimeOut())
+
+    result = push(store, shopify.client(), LOCATION_ID, [target(1, 7, 4)], NOW)
+
+    assert result.outcomes == {variant_id(1): PushOutcome.FAILED}
+    assert result.codes == {variant_id(1): TRANSPORT_FAILURE}
+    assert len(shopify.requests) == 2
+    stamp = utc_timestamp(NOW)
+    assert pending(store) == [(variant_id(1), 7, 4, stamp)]
+    assert quantities(store) == [(variant_id(1), 4, stamp, None, None)]
+    assert history(store) == [(variant_id(1), 7, 4, shopify.keys()[0], stamp, "failed")]
+
+
+def test_user_error_after_a_transport_error_is_handled_like_any_other(
+    store: sqlite3.Connection,
+) -> None:
+    shopify = Shopify(
+        TimeOut(),
+        rejected((CHANGE_FROM_QUANTITY_STALE, at_entry(0))),
+        applied(),
+    )
+
+    result = push(
+        store, shopify.client(), LOCATION_ID, [target(1, 5, 1), target(2, 6, 2)], NOW
+    )
+
+    assert result.outcomes == {
+        variant_id(1): PushOutcome.STALE,
+        variant_id(2): PushOutcome.PUSHED,
+    }
+    first, resent, rebuilt = shopify.keys()
+    assert first == resent != rebuilt
+
+
+ACCESS_DENIED = httpx.Response(
+    200,
+    json={
+        "data": None,
+        "errors": [{"message": "synthetic", "extensions": {"code": "ACCESS_DENIED"}}],
+    },
+)
+
+
+@pytest.mark.parametrize(
+    ("response", "code"),
+    [
+        (httpx.Response(503), "http_503"),
+        (ACCESS_DENIED, "ACCESS_DENIED"),
+        (graphql({"inventorySetQuantities": None}), "unexpected_response"),
+    ],
+)
+def test_failed_batch_stays_pending_and_is_not_resent(
+    store: sqlite3.Connection, response: httpx.Response, code: str
+) -> None:
+    shopify = Shopify(response)
+
+    result = push(store, shopify.client(), LOCATION_ID, [target(1, 7, 4)], NOW)
+
+    assert result.outcomes == {variant_id(1): PushOutcome.FAILED}
+    assert result.codes == {variant_id(1): code}
+    assert len(shopify.requests) == 1
+    assert pending(store) == [(variant_id(1), 7, 4, utc_timestamp(NOW))]
+    assert [row[5] for row in history(store)] == ["failed"]
+
+
+def test_more_targets_than_a_batch_holds_are_sent_in_several_batches(
+    store: sqlite3.Connection,
+) -> None:
+    count = BATCH_LIMIT + 1
+    shopify = Shopify(applied(), applied())
+
+    result = push(
+        store,
+        shopify.client(),
+        LOCATION_ID,
+        [target(n, n + 1, n) for n in range(count)],
+        NOW,
+    )
+
+    assert [len(batch) for batch in shopify.sent()] == [BATCH_LIMIT, 1]
+    assert len(set(shopify.keys())) == 2
+    assert len(result.outcomes) == count
+    assert set(result.outcomes.values()) == {PushOutcome.PUSHED}
+
+
+def test_a_failed_batch_does_not_stop_the_next(store: sqlite3.Connection) -> None:
+    count = BATCH_LIMIT + 1
+    shopify = Shopify(httpx.Response(503), applied())
+
+    result = push(
+        store,
+        shopify.client(),
+        LOCATION_ID,
+        [target(n, n + 1, n) for n in range(count)],
+        NOW,
+    )
+
+    outcomes = list(result.outcomes.values())
+    assert outcomes.count(PushOutcome.FAILED) == BATCH_LIMIT
+    assert outcomes.count(PushOutcome.PUSHED) == 1
+    assert len(pending(store)) == BATCH_LIMIT
+
+
+def test_pending_values_collapse_to_the_latest_while_shopify_is_down(
+    store: sqlite3.Connection,
+) -> None:
+    down = Shopify(httpx.Response(503), httpx.Response(503))
+
+    push(store, down.client(), LOCATION_ID, [target(1, 5, 2)], NOW)
+    push(store, down.client(), LOCATION_ID, [target(1, 4, 3)], LATER)
+
+    assert pending(store) == [(variant_id(1), 4, 3, utc_timestamp(NOW))]
+
+
+def test_recovery_pushes_only_the_latest_value(store: sqlite3.Connection) -> None:
+    down = Shopify(httpx.Response(503), httpx.Response(503))
+    push(store, down.client(), LOCATION_ID, [target(1, 5, 2)], NOW)
+    push(store, down.client(), LOCATION_ID, [target(1, 4, 2)], LATER)
+
+    recovered = Shopify(applied())
+    push(store, recovered.client(), LOCATION_ID, [target(1, 3, 2)], LATER)
+
+    assert recovered.sent() == [[(inventory_item_id(1), 3, 2)]]
+    assert pending(store) == []
+    assert [(row[1], row[5]) for row in history(store)] == [
+        (5, "failed"),
+        (4, "failed"),
+        (3, "pushed"),
+    ]
+
+
+def test_last_pushed_values_are_read_by_variant(store: sqlite3.Connection) -> None:
+    push(store, Shopify(applied()).client(), LOCATION_ID, [target(1, 7, 4)], NOW)
+    push(store, Shopify().client(), LOCATION_ID, [target(2, 3, 3)], NOW)
+    down = Shopify(httpx.Response(503))
+    push(store, down.client(), LOCATION_ID, [target(3, 5, 1)], NOW)
+
+    assert last_pushed_values(store) == {variant_id(1): 7, variant_id(2): 3}
+
+
+def test_unbound_variants_lose_their_pending_values(
+    store: sqlite3.Connection,
+) -> None:
+    store.execute(
+        "INSERT INTO bindings VALUES (?, ?, 'TEST-ITEM-001', ?)",
+        (variant_id(1), inventory_item_id(1), utc_timestamp(NOW)),
+    )
+    push(
+        store,
+        Shopify().client(),
+        LOCATION_ID,
+        [target(1, 3, None), target(2, 4, None)],
+        NOW,
+    )
+
+    drop_unbound_pending(store)
+
+    assert [row[0] for row in pending(store)] == [variant_id(1)]
+
+
+def test_levels_read_then_pushed(store: sqlite3.Connection) -> None:
+    shopify = Shopify(
+        levels_response(level_node(1, 4), level_node(2, 6), level_node(3, None)),
+        applied(),
+    )
+    client = shopify.client()
+    sellable = {1: 5, 2: 6, 3: 1}
+
+    levels = fetch_levels(client, [inventory_item_id(n) for n in sellable], LOCATION_ID)
+    targets = [
+        target(n, value, levels[inventory_item_id(n)].available)
+        for n, value in sellable.items()
+    ]
+    result = push(store, client, LOCATION_ID, targets, NOW)
+
+    assert result.outcomes == {
+        variant_id(1): PushOutcome.PUSHED,
+        variant_id(2): PushOutcome.UNCHANGED,
+        variant_id(3): PushOutcome.NO_LEVEL,
+    }
+    assert shopify.sent() == [[(inventory_item_id(1), 5, 4)]]
