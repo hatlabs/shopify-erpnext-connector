@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -21,7 +21,11 @@ from shopify_erpnext_connector.decisions import Decision, save_decisions
 from shopify_erpnext_connector.problems import (
     Problem,
     ProblemKind,
+    get_problem,
     record_check,
+    record_communication,
+    record_delivered,
+    record_send_attempt,
     show_command,
 )
 from shopify_erpnext_connector.push import PushOutcome
@@ -222,6 +226,31 @@ def test_status_against_the_connector(
     assert "Dry run: on" in out
     assert "Last pass: none yet" in out
     assert OPERATOR_TOKEN not in out + err
+
+
+def test_status_after_a_completed_full_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    state, url = canned
+    state.answer(
+        200,
+        {"environment": "staging"}
+        | STATUS
+        | {"push_lag_seconds": 42.5, "open_problems": 3, "unsent_emails": 1},
+    )
+    configure(monkeypatch, tmp_path, url)
+
+    code, out, err = run(capsys, "status")
+
+    assert code == 0, err
+    lines = out.splitlines()
+    assert f"Last pass: {STATUS['last_pass_at']} (full)" in lines
+    assert "Push lag: 42.5 s" in lines
+    assert "Open problems: 3" in lines
+    assert "Unsent emails: 1" in lines
 
 
 def test_status_as_json(
@@ -483,6 +512,23 @@ def test_answer_that_is_not_json_is_reported(
     assert "502" in err
 
 
+def test_answer_missing_a_required_field_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    state, url = canned
+    state.answer(200, {"environment": "staging"})
+    configure(monkeypatch, tmp_path, url)
+
+    code, out, err = run(capsys, "status")
+
+    assert code != 0
+    assert out == ""
+    assert "bad 'dry_run'" in err
+
+
 def test_unreachable_connector_is_reported(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -600,6 +646,27 @@ def test_the_command_in_a_problem_email_shows_the_problem(
     assert "Short by: 2" in out
     assert f"Opened: {utc_timestamp(NOW)}" in out
     assert "Email: pending" in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_problems_show_of_a_resolved_problem_whose_email_was_sent(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    oversold(store, VARIANT)
+    problem = get_problem(store, ProblemKind.OVERSELL, VARIANT)
+    assert problem is not None
+    record_send_attempt(store, problem, NOW)
+    record_communication(store, problem, "TEST-COMM-0001")
+    record_delivered(store, problem)
+    resolved_at = NOW + timedelta(seconds=1)
+    record_check(store, ProblemKind.OVERSELL, [], resolved_at)
+
+    code, out, err = run(capsys, "problems", "show", f"oversell:{VARIANT}")
+
+    assert code == 0, err
+    lines = out.splitlines()
+    assert f"Resolved: {utc_timestamp(resolved_at)}" in lines
+    assert "Email: not pending, ERPNext Communication TEST-COMM-0001" in lines
 
 
 @pytest.mark.usefixtures("connected")
