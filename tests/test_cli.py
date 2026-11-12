@@ -33,6 +33,8 @@ VARIANT = "gid://shopify/ProductVariant/1001"
 OTHER_VARIANT = "gid://shopify/ProductVariant/1002"
 NO_ITEM = "No ERPNext Item has this item code"
 OPERATOR_TOKEN = "test-operator-token"
+# argparse's exit status for a usage error.
+USAGE_ERROR = 2
 # Kept apart from its value so the fixture check's header pattern stays meaningful.
 AUTH_HEADER = "Authorization"
 STATUS = {
@@ -182,15 +184,26 @@ def test_serve_refuses_an_env_option(capsys: pytest.CaptureFixture[str]) -> None
     with pytest.raises(SystemExit) as exit:
         cli.main(["--env", "production", "serve"])
 
-    assert exit.value.code != 0
+    assert exit.value.code == USAGE_ERROR
     assert "configuration" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [["serve", "--json"], ["--json", "serve"]])
+def test_serve_refuses_a_json_option(
+    capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit:
+        cli.main(argv)
+
+    assert exit.value.code == USAGE_ERROR
+    assert "--json" in capsys.readouterr().err
 
 
 def test_a_command_is_required(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exit:
         cli.main([])
 
-    assert exit.value.code != 0
+    assert exit.value.code == USAGE_ERROR
     assert "serve" in capsys.readouterr().err
 
 

@@ -32,6 +32,7 @@ from shopify_erpnext_connector.problems import CLI_NAME
 from shopify_erpnext_connector.service import serve
 
 ENV_VARIABLE = "CONNECTOR_ENV"
+SERVE_COMMAND = "serve"
 DEFAULT_ENVIRONMENT = Environment.STAGING
 REQUEST_TIMEOUT_SECONDS = 30.0
 EXIT_FAILURE = 1
@@ -413,7 +414,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser = argparse.ArgumentParser(prog=CLI_NAME, parents=[common])
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("serve", help="run the connector service")
+    commands.add_parser(SERVE_COMMAND, help="run the connector service")
     status = commands.add_parser(
         "status", parents=[common], help="last pass, push lag, dry-run and problems"
     )
@@ -452,12 +453,15 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     values = vars(parser.parse_args(argv))
-    read = values.get("read")
     env_option = values.get("env")
-    if not isinstance(read, _Read):
+    if values["command"] == SERVE_COMMAND:
         if env_option is not None:
             parser.error("serve takes its environment from its configuration")
+        if values.get("json"):
+            parser.error("serve has no --json output")
         return serve()
+    read = values["read"]
+    assert isinstance(read, _Read)
     try:
         target = resolve_target(
             env_option if isinstance(env_option, str) else None, os.environ
