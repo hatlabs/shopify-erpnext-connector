@@ -112,6 +112,49 @@ def test_detail_order_does_not_change_the_fingerprint() -> None:
     assert reordered.fingerprint == unbound().fingerprint
 
 
+def with_context(shortfall: str) -> Problem:
+    return Problem(
+        kind=ProblemKind.OVERSELL,
+        subject=VARIANT,
+        details={"Item": "TEST-ITEM-001"},
+        context={"Short by": shortfall},
+    )
+
+
+def test_context_is_left_out_of_the_fingerprint() -> None:
+    assert with_context("1").fingerprint == with_context("2").fingerprint
+
+
+def test_context_is_stored_after_the_details(store: sqlite3.Connection) -> None:
+    record_check(store, ProblemKind.OVERSELL, [with_context("1")], NOW)
+
+    stored = get_problem(store, ProblemKind.OVERSELL, VARIANT)
+    assert stored is not None
+    assert list(stored.details.items()) == [
+        ("Item", "TEST-ITEM-001"),
+        ("Short by", "1"),
+    ]
+
+
+def test_changed_context_is_stored_without_a_new_email(
+    store: sqlite3.Connection,
+) -> None:
+    record_check(store, ProblemKind.OVERSELL, [with_context("1")], NOW)
+    first = get_problem(store, ProblemKind.OVERSELL, VARIANT)
+    assert first is not None
+    record_communication(store, first, "COMM-0001")
+    record_delivered(store, first)
+
+    record_check(store, ProblemKind.OVERSELL, [with_context("2")], LATER)
+
+    stored = get_problem(store, ProblemKind.OVERSELL, VARIANT)
+    assert stored is not None
+    assert stored.details["Short by"] == "2"
+    assert not stored.email_pending
+    assert stored.communication_name == "COMM-0001"
+    assert stored.opened_at == utc_timestamp(NOW)
+
+
 def test_problem_absent_on_a_later_pass_is_resolved_without_email(
     store: sqlite3.Connection,
 ) -> None:

@@ -4,8 +4,11 @@ A problem is keyed by kind and subject (a Shopify variant GID, an ERPNext item
 code or a Shopify order ID) and fingerprinted by its details. Each pass of a
 check reports what it found with `record_check`: a new or reopened problem,
 or one whose fingerprint changed, gets an email pending; a problem the check
-no longer finds is resolved, with no email. The email state lives in the same
-row, so a restart neither loses a pending email nor sends one twice.
+no longer finds is resolved, with no email. A problem's context, such as a
+shortfall that moves with every order, is stored and shown but not
+fingerprinted, so a change in it alone is recorded without a new email. The
+email state lives in the same row, so a restart neither loses a pending email
+nor sends one twice.
 """
 
 import hashlib
@@ -33,15 +36,17 @@ class ProblemKind(StrEnum):
 
 @dataclass(frozen=True)
 class Problem:
-    """What a check found. `details` are shown in the email, in order.
+    """What a check found. `details` and then `context` are shown, in order.
 
-    Details hold identifiers and quantities only: never customer names or
+    Only `details` are fingerprinted: they say what makes it a new problem.
+    Both hold identifiers and quantities only: never customer names or
     addresses.
     """
 
     kind: ProblemKind
     subject: str
     details: Mapping[str, str]
+    context: Mapping[str, str] = field(default_factory=dict)
     fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -190,11 +195,16 @@ def _record_found(
     connection: sqlite3.Connection, problem: Problem, timestamp: str
 ) -> None:
     stored = get_problem(connection, problem.kind, problem.subject)
+    shown = json.dumps({**problem.details, **problem.context})
     if (
         stored is not None
         and stored.resolved_at is None
         and stored.fingerprint == problem.fingerprint
     ):
+        connection.execute(
+            "UPDATE problems SET details = ? WHERE kind = ? AND subject = ?",
+            (shown, problem.kind, problem.subject),
+        )
         return
     reopening = stored is None or stored.resolved_at is not None
     connection.execute(
@@ -210,7 +220,7 @@ def _record_found(
         (
             problem.kind,
             problem.subject,
-            json.dumps(dict(problem.details)),
+            shown,
             problem.fingerprint,
             timestamp,
             reopening,
