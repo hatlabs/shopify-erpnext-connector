@@ -28,6 +28,7 @@ PHASE_A_TABLES = {
     "problems",
     "decisions",
     "audit_log",
+    "sku_changes",
 }
 
 

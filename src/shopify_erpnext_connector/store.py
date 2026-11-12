@@ -95,6 +95,15 @@ MIGRATIONS: tuple[str, ...] = (
         detail TEXT
     );
     """,
+    """
+    -- A variant whose SKU changed since it was bound: the item it was bound
+    -- to, kept while the change is reported so the variant stays unbound.
+    CREATE TABLE sku_changes (
+        variant_id TEXT PRIMARY KEY,
+        bound_item_code TEXT NOT NULL,
+        detected_at TEXT NOT NULL
+    );
+    """,
 )
 
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
