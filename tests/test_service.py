@@ -7,9 +7,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from shopify_erpnext_connector.__main__ import install_stop_handlers, main
 from shopify_erpnext_connector.api import ENVIRONMENT_HEADER
 from shopify_erpnext_connector.config import DEFAULT_API_PORT
+from shopify_erpnext_connector.service import install_stop_handlers, serve
 from shopify_erpnext_connector.store import dry_run, open_store
 from shopify_erpnext_connector.worker import Worker
 
@@ -68,7 +68,7 @@ def test_missing_config_exits_with_config_error(
     monkeypatch.setenv("CONNECTOR_CONFIG", str(missing))
     monkeypatch.setenv("CONNECTOR_SECRETS_DIR", str(tmp_path))
 
-    assert main(stopped()) == os.EX_CONFIG
+    assert serve(stopped()) == os.EX_CONFIG
     assert str(missing) in capsys.readouterr().err
 
 
@@ -81,7 +81,7 @@ def test_valid_config_opens_the_store_and_reports_the_pinned_environment(
     store_path = tmp_path / "connector.sqlite3"
     write_config(tmp_path, monkeypatch, store_path, api_port)
 
-    assert main(stopped()) == os.EX_OK
+    assert serve(stopped()) == os.EX_OK
 
     err = capsys.readouterr().err
     assert "staging" in err
@@ -101,7 +101,7 @@ def test_store_that_cannot_be_opened_exits_with_an_error(
     store_path = tmp_path / "missing-directory" / "connector.sqlite3"
     write_config(tmp_path, monkeypatch, store_path, api_port)
 
-    assert main(stopped()) == os.EX_IOERR
+    assert serve(stopped()) == os.EX_IOERR
     assert str(store_path) in capsys.readouterr().err
 
 
@@ -124,7 +124,7 @@ def test_api_serves_while_the_worker_runs_and_stops_with_it(
 
     monkeypatch.setattr(Worker, "run", run)
 
-    assert main(stopped()) == os.EX_OK
+    assert serve(stopped()) == os.EX_OK
 
     assert statuses == [200]
     with pytest.raises(httpx.ConnectError):
@@ -142,7 +142,7 @@ def test_api_port_in_use_exits_with_an_error(
         taken.bind(("", api_port))
         taken.listen()
 
-        assert main(stopped()) == os.EX_OSERR
+        assert serve(stopped()) == os.EX_OSERR
 
     assert str(api_port) in capsys.readouterr().err
 

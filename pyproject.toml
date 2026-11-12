@@ -19,7 +19,7 @@ dev = [
 ]
 
 [project.scripts]
-shopify-erpnext-connector = "shopify_erpnext_connector.__main__:main"
+shopify-erpnext-connector = "shopify_erpnext_connector.cli:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]

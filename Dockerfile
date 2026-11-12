@@ -18,4 +18,4 @@ RUN useradd --system --no-create-home --uid 10001 connector \
 COPY --from=build /app/.venv /app/.venv
 ENV PATH=/app/.venv/bin:$PATH
 USER connector
-CMD ["shopify-erpnext-connector"]
+CMD ["shopify-erpnext-connector", "serve"]
