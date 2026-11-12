@@ -138,6 +138,26 @@ def test_pending_migrations_apply_in_order(db_path: Path) -> None:
     connection.close()
 
 
+def test_problem_rows_from_version_1_survive_the_problem_details_migration(
+    db_path: Path,
+) -> None:
+    connection = sqlite3.connect(db_path, isolation_level=None)
+    migrate(connection, MIGRATIONS[:1])
+    connection.execute(
+        "INSERT INTO problems (kind, subject, fingerprint, opened_at, email_pending) "
+        "VALUES ('unbound_sku', ?, 'abc', '2026-11-12T10:00:00.000000Z', 1)",
+        (VARIANT_ID,),
+    )
+
+    migrate(connection, MIGRATIONS)
+
+    row = connection.execute(
+        "SELECT subject, details, email_attempts, last_email_attempt_at FROM problems"
+    ).fetchone()
+    assert row == (VARIANT_ID, "{}", 0, None)
+    connection.close()
+
+
 def test_purge_deletes_push_history_past_retention(
     store: sqlite3.Connection,
 ) -> None:

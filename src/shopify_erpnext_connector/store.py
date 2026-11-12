@@ -104,6 +104,14 @@ MIGRATIONS: tuple[str, ...] = (
         detected_at TEXT NOT NULL
     );
     """,
+    """
+    -- The problem's details as a JSON object, rendered into its email.
+    ALTER TABLE problems ADD COLUMN details TEXT NOT NULL DEFAULT '{}';
+    -- Sends of the current problem version, bounded so that a broken mail
+    -- account does not repeat the email every pass.
+    ALTER TABLE problems ADD COLUMN email_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE problems ADD COLUMN last_email_attempt_at TEXT;
+    """,
 )
 
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
