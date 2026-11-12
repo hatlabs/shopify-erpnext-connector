@@ -33,6 +33,7 @@ from shopify_erpnext_connector.store import (
     utc_timestamp,
 )
 from shopify_erpnext_connector.worker import (
+    BINDING_PROBLEM_KINDS,
     EMAIL_CHECK_INTERVAL,
     FULL_PASS_INTERVAL,
     HELD_ACTION,
@@ -1435,3 +1436,11 @@ def test_comparison_report_lists_each_bound_variant(world: World) -> None:
         ),
     ]
     assert world.shopify.mutations == []
+
+
+def test_binding_problem_kinds_are_unbound_ambiguous_then_changed() -> None:
+    assert BINDING_PROBLEM_KINDS == (
+        ProblemKind.UNBOUND_SKU,
+        ProblemKind.AMBIGUOUS_SKU,
+        ProblemKind.CHANGED_SKU,
+    )

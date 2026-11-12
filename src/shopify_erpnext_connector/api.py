@@ -49,7 +49,7 @@ from shopify_erpnext_connector.problems import (
 )
 from shopify_erpnext_connector.push import recent_pushes, unpushed_since
 from shopify_erpnext_connector.store import dry_run, utc_timestamp
-from shopify_erpnext_connector.worker import SKU_DETAIL
+from shopify_erpnext_connector.worker import BINDING_PROBLEM_KINDS, SKU_DETAIL
 
 ENVIRONMENT_HEADER = "X-Connector-Environment"
 JSON_CONTENT_TYPE = "application/json"
@@ -60,12 +60,6 @@ PASS_STALE_AFTER = timedelta(minutes=5)
 
 # The newest push attempts `record` shows.
 RECORD_PUSH_HISTORY = 10
-# The problems that say why a variant is not bound.
-_BINDING_PROBLEM_KINDS = (
-    ProblemKind.UNBOUND_SKU,
-    ProblemKind.AMBIGUOUS_SKU,
-    ProblemKind.CHANGED_SKU,
-)
 
 # How often the serving loop checks for `close`, so stopping takes at most this.
 SHUTDOWN_POLL_SECONDS = 0.1
@@ -307,7 +301,7 @@ class ApiServer:
         binding_problem = next(
             (
                 problem
-                for kind in _BINDING_PROBLEM_KINDS
+                for kind in BINDING_PROBLEM_KINDS
                 if (problem := get_problem(connection, kind, variant_id)) is not None
                 and problem.resolved_at is None
             ),
