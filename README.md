@@ -30,7 +30,7 @@ The image runs the service with `shopify-erpnext-connector serve`. The same proc
 
 ## Operator CLI
 
-The other `shopify-erpnext-connector` commands are the operator CLI, which reads from a connector's API. Install it into the ops venv with `uv tool install git+https://github.com/hatlabs/shopify-erpnext-connector`, or with `uv pip install git+https://github.com/hatlabs/shopify-erpnext-connector` into an existing venv.
+The other `shopify-erpnext-connector` commands are the operator CLI, which reads from a connector's API. Install it with `uv tool install git+https://github.com/hatlabs/shopify-erpnext-connector`.
 
 Each environment is set by two variables, for example in the ops workspace's `.env`. The token is the operator token the connector has as `operator_token_<name>`, kept in a file the variable names; the CLI never takes a token from a variable or an argument.
 
