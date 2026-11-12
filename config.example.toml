@@ -15,3 +15,12 @@ location_id = "gid://shopify/Location/1234567890"
 
 [erpnext]
 url = "https://erpnext.example.com"
+
+[email]
+# Problem emails go out through ERPNext's outgoing email account. Staging
+# keeps this false: problems are still recorded and shown by the CLI.
+enabled = false
+# Who receives problem emails.
+recipient = "operator@example.com"
+# The From address, passed to ERPNext explicitly.
+sender = "notifications@example.com"

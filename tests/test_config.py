@@ -4,6 +4,7 @@ import pytest
 
 from shopify_erpnext_connector.config import (
     ConfigError,
+    EmailConfig,
     Environment,
     Secret,
     load_config,
@@ -12,6 +13,8 @@ from shopify_erpnext_connector.config import (
 SHOP_DOMAIN = "example.myshopify.com"
 LOCATION_ID = "gid://shopify/Location/1234567890"
 ERPNEXT_URL = "https://erpnext.example.com"
+RECIPIENT = "operator@example.com"
+SENDER = "notifications@example.com"
 
 CONFIG_TOML = f"""\
 environment = "staging"
@@ -23,6 +26,11 @@ location_id = "{LOCATION_ID}"
 
 [erpnext]
 url = "{ERPNEXT_URL}"
+
+[email]
+enabled = false
+recipient = "{RECIPIENT}"
+sender = "{SENDER}"
 """
 
 SECRET_VALUES = {
@@ -59,6 +67,9 @@ def test_config_and_secrets_pin_the_environment(
     assert config.shop_domain == SHOP_DOMAIN
     assert config.location_id == LOCATION_ID
     assert config.erpnext_url == ERPNEXT_URL
+    assert config.email == EmailConfig(
+        enabled=False, recipient=RECIPIENT, sender=SENDER
+    )
     assert config.secrets.erpnext_api_key.reveal() == "test-erpnext-key"
     assert config.secrets.erpnext_api_secret.reveal() == "test-erpnext-secret"
     assert config.secrets.shopify_access_token.reveal() == "test-shopify-token"
@@ -140,6 +151,9 @@ def test_empty_secret_file_is_rejected(config_path: Path, secrets_dir: Path) -> 
         (f'shop_domain = "{SHOP_DOMAIN}"\n', "shopify.shop_domain"),
         (f'location_id = "{LOCATION_ID}"\n', "shopify.location_id"),
         (f'url = "{ERPNEXT_URL}"\n', "erpnext.url"),
+        ("enabled = false\n", "email.enabled"),
+        (f'recipient = "{RECIPIENT}"\n', "email.recipient"),
+        (f'sender = "{SENDER}"\n', "email.sender"),
     ],
 )
 def test_missing_mandatory_field_fails_naming_it(
@@ -148,6 +162,36 @@ def test_missing_mandatory_field_fails_naming_it(
     config_path.write_text(CONFIG_TOML.replace(removed_line, ""))
 
     with pytest.raises(ConfigError, match=f"'{field}'"):
+        load_config(config_path, secrets_dir)
+
+
+def test_email_sending_can_be_enabled(config_path: Path, secrets_dir: Path) -> None:
+    config_path.write_text(CONFIG_TOML.replace("enabled = false", "enabled = true"))
+
+    assert load_config(config_path, secrets_dir).email.enabled is True
+
+
+def test_email_enabled_must_be_a_boolean(config_path: Path, secrets_dir: Path) -> None:
+    config_path.write_text(CONFIG_TOML.replace("enabled = false", 'enabled = "no"'))
+
+    with pytest.raises(ConfigError, match="'email.enabled' must be true or false"):
+        load_config(config_path, secrets_dir)
+
+
+@pytest.mark.parametrize("field", ["recipient", "sender"])
+@pytest.mark.parametrize(
+    "address",
+    ["operator", "operator@", "@example.com", "Operator <operator@example.com>"],
+)
+def test_email_address_must_be_a_bare_address(
+    config_path: Path, secrets_dir: Path, field: str, address: str
+) -> None:
+    original = RECIPIENT if field == "recipient" else SENDER
+    config_path.write_text(
+        CONFIG_TOML.replace(f'{field} = "{original}"', f'{field} = "{address}"')
+    )
+
+    with pytest.raises(ConfigError, match=f"'email.{field}'"):
         load_config(config_path, secrets_dir)
 
 
