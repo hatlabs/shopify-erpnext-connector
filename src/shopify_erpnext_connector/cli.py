@@ -112,6 +112,11 @@ def fetch(target: Target, path: str, params: Mapping[str, str]) -> JsonObject:
             headers=headers,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
+    # InvalidURL is not an HTTPError.
+    except httpx.InvalidURL as error:
+        raise CliError(
+            f"{url_variable(target.environment)} is not a valid URL: {error}"
+        ) from None
     except httpx.HTTPError as error:
         raise CliError(
             f"cannot reach the {target.environment} connector at {target.url}: {error}"

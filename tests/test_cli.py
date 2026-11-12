@@ -485,6 +485,19 @@ def test_unreachable_connector_is_reported(
     assert url in err
 
 
+def test_malformed_url_is_reported_naming_its_variable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    configure(monkeypatch, tmp_path, "http://host:abc")
+
+    code, out, err = run(capsys, "status")
+
+    assert code == cli.EXIT_FAILURE
+    assert out == ""
+    assert "CONNECTOR_STAGING_URL" in err
+    assert len(err.splitlines()) == 1
+
+
 def unbound(store: sqlite3.Connection, variant_id: str, sku: str) -> None:
     record_check(
         store,
