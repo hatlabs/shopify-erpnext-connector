@@ -81,12 +81,12 @@ class Secrets:
     @classmethod
     def read(cls, directory: Path, operators: Sequence[str]) -> "Secrets":
         return cls(
-            erpnext_api_key=_read_secret(directory, "erpnext_api_key"),
-            erpnext_api_secret=_read_secret(directory, "erpnext_api_secret"),
-            shopify_access_token=_read_secret(directory, "shopify_access_token"),
-            metrics_token=_read_secret(directory, "metrics_token"),
+            erpnext_api_key=read_secret(directory / "erpnext_api_key"),
+            erpnext_api_secret=read_secret(directory / "erpnext_api_secret"),
+            shopify_access_token=read_secret(directory / "shopify_access_token"),
+            metrics_token=read_secret(directory / "metrics_token"),
             operator_tokens={
-                name: _read_secret(directory, OPERATOR_TOKEN_PREFIX + name)
+                name: read_secret(directory / (OPERATOR_TOKEN_PREFIX + name))
                 for name in operators
             },
         )
@@ -319,8 +319,8 @@ def _read_toml(path: Path) -> Mapping[str, object]:
         raise ConfigError(f"{path}: invalid TOML: {error}") from None
 
 
-def _read_secret(directory: Path, name: str) -> Secret:
-    path = directory / name
+def read_secret(path: Path) -> Secret:
+    """The secret in the file at `path`, without its trailing newline."""
     # Errors name the file only: an OS or decode error message can quote content.
     try:
         text = path.read_text(encoding="utf-8")
