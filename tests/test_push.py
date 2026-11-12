@@ -8,6 +8,7 @@ import httpx
 import pytest
 from helpers import LOCATION_ID, SHOP_DOMAIN, make_config
 
+from shopify_erpnext_connector.problems import Problem, ProblemKind
 from shopify_erpnext_connector.push import (
     LEVELS_PAGE_SIZE,
     TRANSPORT_FAILURE,
@@ -18,6 +19,7 @@ from shopify_erpnext_connector.push import (
     fetch_levels,
     last_pushed_values,
     push,
+    stale_pushes,
 )
 from shopify_erpnext_connector.shopify import (
     BATCH_LIMIT,
@@ -760,3 +762,113 @@ def test_levels_read_then_pushed(store: sqlite3.Connection) -> None:
         variant_id(3): PushOutcome.NO_LEVEL,
     }
     assert shopify.sent() == [[(inventory_item_id(1), 5, 4)]]
+
+
+# Stale pushes
+
+THRESHOLD = timedelta(minutes=30)
+
+
+def fail_pushes(store: sqlite3.Connection, targets: list[PushTarget]) -> None:
+    down = Shopify(httpx.Response(503))
+    push(store, down.client(), LOCATION_ID, targets, NOW)
+
+
+def stale(
+    store: sqlite3.Connection,
+    now: datetime = NOW + THRESHOLD,
+    waiting_since: Mapping[str, str] | None = None,
+) -> Problem | None:
+    return stale_pushes(
+        store,
+        now,
+        THRESHOLD,
+        location_id=LOCATION_ID,
+        waiting_since=waiting_since or {},
+    )
+
+
+def test_variants_unpushed_past_the_threshold_are_one_problem(
+    store: sqlite3.Connection,
+) -> None:
+    fail_pushes(store, [target(2, 6, 1), target(1, 5, 1)])
+
+    problem = stale(store)
+
+    assert problem == Problem(
+        ProblemKind.STALE_PUSH,
+        LOCATION_ID,
+        {},
+        context={
+            "Unpushed variants": "2",
+            "Unpushed since": "2026-11-12 10:00 UTC",
+            "Variants": f"{variant_id(1)}, {variant_id(2)}",
+        },
+    )
+
+
+def test_stale_push_lists_at_most_ten_variants(store: sqlite3.Connection) -> None:
+    fail_pushes(store, [target(n, 5, 1) for n in range(12)])
+
+    problem = stale(store)
+
+    assert problem is not None
+    assert problem.context["Unpushed variants"] == "12"
+    assert problem.context["Variants"] == ", ".join(
+        sorted(variant_id(n) for n in range(12))[:10]
+    )
+
+
+def test_variant_unpushed_for_less_than_the_threshold_is_no_problem(
+    store: sqlite3.Connection,
+) -> None:
+    fail_pushes(store, [target(1, 5, 1)])
+
+    assert stale(store, NOW + THRESHOLD - timedelta(microseconds=1)) is None
+
+
+def test_stale_push_fingerprint_stays_as_the_variants_change(
+    store: sqlite3.Connection,
+) -> None:
+    fail_pushes(store, [target(1, 5, 1)])
+    first = stale(store, LATER + THRESHOLD)
+    down = Shopify(httpx.Response(503))
+    push(store, down.client(), LOCATION_ID, [target(1, 4, 1), target(2, 3, 1)], LATER)
+
+    second = stale(store, LATER + THRESHOLD)
+
+    assert first is not None
+    assert second is not None
+    assert second.context["Unpushed variants"] == "2"
+    assert second.fingerprint == first.fingerprint
+
+
+def test_pushed_variant_is_no_longer_a_stale_push(store: sqlite3.Connection) -> None:
+    fail_pushes(store, [target(1, 5, 1)])
+    push(store, Shopify(applied()).client(), LOCATION_ID, [target(1, 5, 1)], LATER)
+
+    assert stale(store) is None
+
+
+def test_variant_waiting_past_the_threshold_without_a_pending_value_is_stale(
+    store: sqlite3.Connection,
+) -> None:
+    waiting = {variant_id(1): utc_timestamp(NOW), variant_id(2): utc_timestamp(LATER)}
+
+    problem = stale(store, waiting_since=waiting)
+
+    assert problem is not None
+    assert problem.context["Variants"] == variant_id(1)
+
+
+def test_variant_both_waiting_and_pending_counts_once_since_the_earlier(
+    store: sqlite3.Connection,
+) -> None:
+    fail_pushes(store, [target(1, 5, 1)])
+    earlier = NOW - timedelta(minutes=10)
+
+    problem = stale(store, waiting_since={variant_id(1): utc_timestamp(earlier)})
+
+    assert problem is not None
+    assert problem.context["Unpushed variants"] == "1"
+    assert problem.context["Unpushed since"] == "2026-11-12 09:50 UTC"

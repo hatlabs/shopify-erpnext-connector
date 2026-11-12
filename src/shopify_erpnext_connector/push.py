@@ -22,9 +22,11 @@ from collections import Counter
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 
+from shopify_erpnext_connector.numeric import is_integer
+from shopify_erpnext_connector.problems import Problem, ProblemKind
 from shopify_erpnext_connector.shopify import (
     CHANGE_FROM_QUANTITY_STALE,
     InventoryBatch,
@@ -49,6 +51,9 @@ AVAILABLE = "available"
 TRANSPORT_FAILURE = "transport"
 UNEXPECTED_RESPONSE = "unexpected_response"
 UNKNOWN_USER_ERROR = "unknown"
+
+UNPUSHED_SINCE_FORMAT = "%Y-%m-%d %H:%M UTC"
+STALE_VARIANTS_SHOWN = 10
 
 _log = logging.getLogger(__name__)
 
@@ -131,8 +136,7 @@ def _available(quantities: object) -> int:
             raise _unexpected_levels()
         if entry.get("name") == AVAILABLE:
             quantity = entry.get("quantity")
-            # bool is an int subclass; a boolean is not a quantity.
-            if not isinstance(quantity, int) or isinstance(quantity, bool):
+            if not is_integer(quantity):
                 raise _unexpected_levels()
             return quantity
     raise _unexpected_levels()
@@ -398,6 +402,47 @@ def _record_outcomes(
             " WHERE variant_id = ?",
             [(t.value, stamp, t.variant_id) for t in pushed],
         )
+
+
+def stale_pushes(
+    connection: sqlite3.Connection,
+    now: datetime,
+    threshold: timedelta,
+    *,
+    location_id: str,
+    waiting_since: Mapping[str, str],
+) -> Problem | None:
+    """One problem for the location while any variant has gone unpushed too long.
+
+    `waiting_since` holds, by variant ID, stored timestamps from when a
+    variant started waiting for a value not yet computed, such as when its
+    item was marked dirty: a pass that fails before pushing queues nothing.
+    A variant counts once, unpushed since the earlier of the two times.
+
+    One problem rather than one per variant, so an outage emails once. The
+    variants and times go in the context, which is not fingerprinted: they
+    change as the outage goes on, and each change would email it again.
+    """
+    since = dict(waiting_since)
+    rows = connection.execute("SELECT variant_id, queued_at FROM pending_pushes")
+    for variant_id, queued_at in rows:
+        since[variant_id] = min(queued_at, since.get(variant_id, queued_at))
+    cutoff = utc_timestamp(now - threshold)
+    # Stored timestamps are fixed-width UTC, so they order as strings.
+    stale = {v: stamp for v, stamp in since.items() if stamp <= cutoff}
+    if not stale:
+        return None
+    oldest = datetime.fromisoformat(min(stale.values()))
+    return Problem(
+        ProblemKind.STALE_PUSH,
+        location_id,
+        {},
+        context={
+            "Unpushed variants": str(len(stale)),
+            "Unpushed since": oldest.strftime(UNPUSHED_SINCE_FORMAT),
+            "Variants": ", ".join(sorted(stale)[:STALE_VARIANTS_SHOWN]),
+        },
+    )
 
 
 @contextmanager
