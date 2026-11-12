@@ -26,6 +26,8 @@ The connector reads one non-secret TOML file and a directory holding one file pe
 
 The image runs as uid 10001, and Compose mounts secret files with their host owner and mode, so make them readable by that uid: `chown 10001 secrets/* && chmod 400 secrets/*`. The connector keeps its state in a SQLite store under `/var/lib/shopify-erpnext-connector`, a volume in the example. A new store starts in dry-run: the connector computes and records what it would push but writes nothing to Shopify until an operator turns dry-run off.
 
+The same process serves an HTTP API on every interface, on port 8080 unless `[api] port` says otherwise. It speaks plain HTTP, so terminate TLS in front of it. `GET /status` answers operators: each request carries an operator token as a bearer token and names the environment it expects in the `X-Connector-Environment` header, and a request for another environment is refused. `GET /metrics` serves Prometheus gauges and takes only the metrics token.
+
 ## License
 
 [AGPL-3.0](LICENSE)

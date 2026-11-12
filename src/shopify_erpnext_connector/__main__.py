@@ -8,6 +8,7 @@ from pathlib import Path
 
 import httpx
 
+from shopify_erpnext_connector.api import ApiServer
 from shopify_erpnext_connector.config import ConfigError, load_config
 from shopify_erpnext_connector.erpnext import ErpNextClient
 from shopify_erpnext_connector.shopify import ShopifyClient
@@ -32,7 +33,7 @@ def install_stop_handlers(stop: threading.Event) -> None:
 
 
 def main(stop: threading.Event | None = None) -> int:
-    """Run the worker until SIGTERM or SIGINT, or until `stop` is set."""
+    """Run the worker and the API until SIGTERM or SIGINT, or until `stop` is set."""
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
@@ -72,7 +73,19 @@ def main(stop: threading.Event | None = None) -> int:
                 ShopifyClient(config, shopify_http),
                 ErpNextClient(config, erpnext_http),
             )
-            worker.run(stop)
+            try:
+                api = ApiServer(config, worker)
+            except OSError as error:
+                print(
+                    f"cannot serve the API on port {config.api.port}: {error}",
+                    file=sys.stderr,
+                )
+                return os.EX_OSERR
+            api.start()
+            try:
+                worker.run(stop)
+            finally:
+                api.close()
     finally:
         connection.close()
     return os.EX_OK
