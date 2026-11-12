@@ -6,6 +6,9 @@
 # staging or production
 environment = "staging"
 
+# The SQLite store; its directory must be writable by the connector.
+# store_path = "/var/lib/shopify-erpnext-connector/connector.sqlite3"
+
 # Operators allowed to use the CLI; each needs an operator_token_<name> file.
 operators = ["alice"]
 
@@ -15,6 +18,8 @@ location_id = "gid://shopify/Location/1234567890"
 
 [erpnext]
 url = "https://erpnext.example.com"
+# The one warehouse whose stock is sold on Shopify.
+warehouse = "Stores - TEST"
 
 [email]
 # Problem emails go out through ERPNext's outgoing email account. Staging
@@ -24,3 +29,10 @@ enabled = false
 recipient = "operator@example.com"
 # The From address, passed to ERPNext explicitly.
 sender = "notifications@example.com"
+
+# Optional worker tunables; the defaults are shown.
+[worker]
+# How often ERPNext is polled for Bin changes.
+poll_interval_seconds = 5
+# A variant whose stock has gone unpushed this long becomes a problem.
+push_stale_after_minutes = 30

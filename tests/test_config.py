@@ -1,18 +1,22 @@
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from shopify_erpnext_connector.config import (
+    DEFAULT_STORE_PATH,
     ConfigError,
     EmailConfig,
     Environment,
     Secret,
+    WorkerConfig,
     load_config,
 )
 
 SHOP_DOMAIN = "example.myshopify.com"
 LOCATION_ID = "gid://shopify/Location/1234567890"
 ERPNEXT_URL = "https://erpnext.example.com"
+WAREHOUSE = "Stores - TEST"
 RECIPIENT = "operator@example.com"
 SENDER = "notifications@example.com"
 
@@ -26,6 +30,7 @@ location_id = "{LOCATION_ID}"
 
 [erpnext]
 url = "{ERPNEXT_URL}"
+warehouse = "{WAREHOUSE}"
 
 [email]
 enabled = false
@@ -67,6 +72,7 @@ def test_config_and_secrets_pin_the_environment(
     assert config.shop_domain == SHOP_DOMAIN
     assert config.location_id == LOCATION_ID
     assert config.erpnext_url == ERPNEXT_URL
+    assert config.warehouse == WAREHOUSE
     assert config.email == EmailConfig(
         enabled=False, recipient=RECIPIENT, sender=SENDER
     )
@@ -151,6 +157,7 @@ def test_empty_secret_file_is_rejected(config_path: Path, secrets_dir: Path) -> 
         (f'shop_domain = "{SHOP_DOMAIN}"\n', "shopify.shop_domain"),
         (f'location_id = "{LOCATION_ID}"\n', "shopify.location_id"),
         (f'url = "{ERPNEXT_URL}"\n', "erpnext.url"),
+        (f'warehouse = "{WAREHOUSE}"\n', "erpnext.warehouse"),
         ("enabled = false\n", "email.enabled"),
         (f'recipient = "{RECIPIENT}"\n', "email.recipient"),
         (f'sender = "{SENDER}"\n', "email.sender"),
@@ -429,3 +436,76 @@ def test_example_config_loads(tmp_path: Path) -> None:
         (secrets / name).write_text("placeholder")
 
     assert load_config(example, secrets).shop_domain == "example.myshopify.com"
+
+
+def test_worker_settings_and_store_path_have_defaults(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    config = load_config(config_path, secrets_dir)
+
+    assert config.worker == WorkerConfig(
+        poll_interval=timedelta(seconds=5), push_stale_after=timedelta(minutes=30)
+    )
+    assert config.store_path == Path(DEFAULT_STORE_PATH)
+
+
+def test_worker_settings_and_store_path_can_be_set(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    config_path.write_text(
+        'store_path = "/data/connector.sqlite3"\n'
+        + CONFIG_TOML
+        + "\n[worker]\npoll_interval_seconds = 2.5\npush_stale_after_minutes = 45\n"
+    )
+
+    config = load_config(config_path, secrets_dir)
+
+    assert config.worker == WorkerConfig(
+        poll_interval=timedelta(seconds=2.5), push_stale_after=timedelta(minutes=45)
+    )
+    assert config.store_path == Path("/data/connector.sqlite3")
+
+
+@pytest.mark.parametrize("value", ["0", "-1", '"5"', "true"])
+def test_poll_interval_must_be_a_positive_number(
+    config_path: Path, secrets_dir: Path, value: str
+) -> None:
+    config_path.write_text(
+        CONFIG_TOML + f"\n[worker]\npoll_interval_seconds = {value}\n"
+    )
+
+    with pytest.raises(
+        ConfigError, match="'worker.poll_interval_seconds' must be a positive number"
+    ):
+        load_config(config_path, secrets_dir)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", '"30"', "true"])
+def test_push_stale_after_must_be_a_positive_whole_number(
+    config_path: Path, secrets_dir: Path, value: str
+) -> None:
+    config_path.write_text(
+        CONFIG_TOML + f"\n[worker]\npush_stale_after_minutes = {value}\n"
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match="'worker.push_stale_after_minutes' must be a positive whole number",
+    ):
+        load_config(config_path, secrets_dir)
+
+
+def test_unknown_worker_field_is_rejected(config_path: Path, secrets_dir: Path) -> None:
+    config_path.write_text(CONFIG_TOML + "\n[worker]\npoll_interval = 5\n")
+
+    with pytest.raises(ConfigError, match="worker.poll_interval"):
+        load_config(config_path, secrets_dir)
+
+
+def test_store_path_must_be_a_non_empty_string(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    config_path.write_text('store_path = ""\n' + CONFIG_TOML)
+
+    with pytest.raises(ConfigError, match="'store_path' must be a non-empty string"):
+        load_config(config_path, secrets_dir)

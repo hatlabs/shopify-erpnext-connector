@@ -11,7 +11,10 @@ COPY src/ src/
 RUN uv sync --locked --no-dev --no-editable
 
 FROM python:3.11-slim AS runtime
-RUN useradd --system --no-create-home --uid 10001 connector
+# The store directory exists in the image, owned by the connector, so a new
+# named volume mounted there starts with that owner.
+RUN useradd --system --no-create-home --uid 10001 connector \
+    && install -d -o connector -m 700 /var/lib/shopify-erpnext-connector
 COPY --from=build /app/.venv /app/.venv
 ENV PATH=/app/.venv/bin:$PATH
 USER connector

@@ -6,14 +6,15 @@
 #
 #   chown 10001 secrets/* && chmod 400 secrets/*
 #
-# The connector currently loads its config and exits, so try it with
-# `docker compose run --rm connector`. A restart policy returns with the
-# service loop; until then it would restart the container in a loop.
+# The store lives in the `store` volume. The connector starts in dry-run, so
+# it pushes nothing to Shopify until an operator turns dry-run off.
 services:
   connector:
     image: ghcr.io/hatlabs/shopify-erpnext-connector:latest
+    restart: unless-stopped
     volumes:
       - ./config.toml:/etc/shopify-erpnext-connector/config.toml:ro
+      - store:/var/lib/shopify-erpnext-connector
     secrets:
       - erpnext_api_key
       - erpnext_api_secret
@@ -32,3 +33,6 @@ secrets:
     file: ./secrets/metrics_token
   operator_token_alice:
     file: ./secrets/operator_token_alice
+
+volumes:
+  store:

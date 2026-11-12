@@ -22,7 +22,7 @@ from enum import StrEnum
 
 from shopify_erpnext_connector.erpnext import ErpNextClient, ErpNextError
 from shopify_erpnext_connector.shopify import ShopifyClient, ShopifyError
-from shopify_erpnext_connector.store import utc_timestamp
+from shopify_erpnext_connector.store import transaction, utc_timestamp
 
 # Shopify's maximum page size; a page costs about three points per variant.
 VARIANT_PAGE_SIZE = 250
@@ -259,6 +259,15 @@ def load_previous(connection: sqlite3.Connection) -> dict[str, str]:
     return dict(rows.fetchall())
 
 
+def load_bindings(connection: sqlite3.Connection) -> list[Binding]:
+    """The stored bindings, ordered by item code."""
+    rows = connection.execute(
+        "SELECT variant_id, inventory_item_id, item_code FROM bindings"
+        " ORDER BY item_code"
+    ).fetchall()
+    return [Binding(*row) for row in rows]
+
+
 def save_bindings(
     connection: sqlite3.Connection, result: BindingResult, now: datetime
 ) -> None:
@@ -270,8 +279,7 @@ def save_bindings(
     stamp = utc_timestamp(now)
     wanted = {(b.variant_id, b.inventory_item_id, b.item_code) for b in result.bindings}
     changes = [u for u in result.unbound if u.kind is UnboundKind.SKU_CHANGED]
-    connection.execute("BEGIN")
-    try:
+    with transaction(connection):
         stored = connection.execute(
             "SELECT variant_id, inventory_item_id, item_code FROM bindings"
         ).fetchall()
@@ -285,10 +293,6 @@ def save_bindings(
             [(*row, stamp) for row in sorted(wanted)],
         )
         _replace_changes(connection, changes, stamp)
-        connection.execute("COMMIT")
-    except BaseException:
-        connection.execute("ROLLBACK")
-        raise
 
 
 def _replace_changes(

@@ -24,7 +24,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 
 The connector reads one non-secret TOML file and a directory holding one file per secret; secrets are never read from environment variables. See [config.example.toml](config.example.toml) and [compose.example.yaml](compose.example.yaml).
 
-The image runs as uid 10001, and Compose mounts secret files with their host owner and mode, so make them readable by that uid: `chown 10001 secrets/* && chmod 400 secrets/*`. The connector currently loads its config and exits; try it with `docker compose run --rm connector`.
+The image runs as uid 10001, and Compose mounts secret files with their host owner and mode, so make them readable by that uid: `chown 10001 secrets/* && chmod 400 secrets/*`. The connector keeps its state in a SQLite store under `/var/lib/shopify-erpnext-connector`, a volume in the example. A new store starts in dry-run: the connector computes and records what it would push but writes nothing to Shopify until an operator turns dry-run off.
 
 ## License
 

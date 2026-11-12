@@ -345,7 +345,7 @@ def _user_error(
     user_errors: tuple[UserError, ...], changes: tuple[QuantityChange, ...]
 ) -> ShopifyUserError:
     indices = sorted(
-        {i for e in user_errors if (i := _entry_index(e, changes)) is not None}
+        {i for e in user_errors if (i := entry_index(e, changes)) is not None}
     )
     failed = tuple(changes[i] for i in indices)
     codes = ", ".join(e.code or "?" for e in user_errors)
@@ -355,7 +355,8 @@ def _user_error(
     return ShopifyUserError(message, user_errors, failed)
 
 
-def _entry_index(error: UserError, changes: tuple[QuantityChange, ...]) -> int | None:
+def entry_index(error: UserError, changes: tuple[QuantityChange, ...]) -> int | None:
+    """The index in `changes` of the entry the error names, if it names one."""
     prefix_length = len(_QUANTITIES_FIELD)
     if error.field[:prefix_length] != _QUANTITIES_FIELD:
         return None

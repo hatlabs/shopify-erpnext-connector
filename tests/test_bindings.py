@@ -19,6 +19,7 @@ from shopify_erpnext_connector.bindings import (
     compute_bindings,
     fetch_items,
     fetch_variants,
+    load_bindings,
     load_previous,
     refresh_bindings,
     save_bindings,
@@ -562,6 +563,19 @@ def test_save_bindings_stores_each_binding_with_its_time(
 
     assert binding_rows(store) == [
         (v.variant_id, v.inventory_item_id, "TEST-ITEM", utc_timestamp(NOW))
+    ]
+
+
+def test_load_bindings_returns_the_stored_bindings_by_item_code(
+    store: sqlite3.Connection,
+) -> None:
+    second, first = variant(1, "TEST-B"), variant(2, "TEST-A")
+
+    run_pass(store, [second, first], [item("TEST-A"), item("TEST-B")])
+
+    assert load_bindings(store) == [
+        binding_of(first, "TEST-A"),
+        binding_of(second, "TEST-B"),
     ]
 
 
