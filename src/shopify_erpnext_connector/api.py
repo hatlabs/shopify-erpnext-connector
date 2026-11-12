@@ -24,7 +24,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import partial
@@ -34,8 +34,9 @@ from socketserver import BaseServer
 from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
 
-from shopify_erpnext_connector.bindings import load_sku_changes
+from shopify_erpnext_connector.bindings import bound_item_code, load_sku_changes
 from shopify_erpnext_connector.config import Config
+from shopify_erpnext_connector.decisions import load_decision
 from shopify_erpnext_connector.problems import (
     ProblemKind,
     StoredProblem,
@@ -46,7 +47,7 @@ from shopify_erpnext_connector.problems import (
     parse_problem_key,
     problem_key,
 )
-from shopify_erpnext_connector.push import unpushed_since
+from shopify_erpnext_connector.push import recent_pushes, unpushed_since
 from shopify_erpnext_connector.store import dry_run, utc_timestamp
 from shopify_erpnext_connector.worker import SKU_DETAIL
 
@@ -56,6 +57,15 @@ METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 # No completed pass for this long, counted from start before the first one,
 # reports the pass as stale.
 PASS_STALE_AFTER = timedelta(minutes=5)
+
+# The newest push attempts `record` shows.
+RECORD_PUSH_HISTORY = 10
+# The problems that say why a variant is not bound.
+_BINDING_PROBLEM_KINDS = (
+    ProblemKind.UNBOUND_SKU,
+    ProblemKind.AMBIGUOUS_SKU,
+    ProblemKind.CHANGED_SKU,
+)
 
 # How often the serving loop checks for `close`, so stopping takes at most this.
 SHUTDOWN_POLL_SECONDS = 0.1
@@ -286,6 +296,43 @@ class ApiServer:
             },
         )
 
+    def record(self, request: _Request) -> _Response:
+        variant_id = request.query.get("variant")
+        if variant_id is None:
+            return self.error(
+                HTTPStatus.BAD_REQUEST, "the variant parameter is required"
+            )
+        connection = request.connection
+        item_code = bound_item_code(connection, variant_id)
+        binding_problem = next(
+            (
+                problem
+                for kind in _BINDING_PROBLEM_KINDS
+                if (problem := get_problem(connection, kind, variant_id)) is not None
+                and problem.resolved_at is None
+            ),
+            None,
+        )
+        decision = load_decision(connection, variant_id)
+        history = recent_pushes(connection, variant_id, RECORD_PUSH_HISTORY)
+        known = item_code or binding_problem or decision or history
+        if not known:
+            return self.error(
+                HTTPStatus.NOT_FOUND, f"no record of variant {variant_id}"
+            )
+        return self.json(
+            HTTPStatus.OK,
+            {
+                "variant_id": variant_id,
+                "bound_item_code": item_code,
+                "binding_problem": (
+                    None if binding_problem is None else _problem_json(binding_problem)
+                ),
+                "decision": None if decision is None else asdict(decision),
+                "push_history": [asdict(attempt) for attempt in history],
+            },
+        )
+
     def metrics(self, request: _Request) -> _Response:
         connection = request.connection
         now = self._clock()
@@ -364,6 +411,7 @@ _ROUTES: Mapping[str, _Route] = {
     "/problems": _Route("GET", _Access.OPERATOR, ApiServer.problems),
     "/problem": _Route("GET", _Access.OPERATOR, ApiServer.problem),
     "/bindings": _Route("GET", _Access.OPERATOR, ApiServer.bindings),
+    "/record": _Route("GET", _Access.OPERATOR, ApiServer.record),
 }
 
 

@@ -14,12 +14,15 @@ from shopify_erpnext_connector.api import (
     ENVIRONMENT_HEADER,
     METRICS_CONTENT_TYPE,
     PASS_STALE_AFTER,
+    RECORD_PUSH_HISTORY,
     ApiServer,
     audit,
 )
 from shopify_erpnext_connector.config import ApiConfig, Environment, Secret
+from shopify_erpnext_connector.decisions import Decision, save_decisions
 from shopify_erpnext_connector.poller import mark_dirty
 from shopify_erpnext_connector.problems import Problem, ProblemKind, record_check
+from shopify_erpnext_connector.push import PushOutcome
 from shopify_erpnext_connector.store import open_store, set_dry_run, utc_timestamp
 
 NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
@@ -695,3 +698,152 @@ def test_held_sku_change_without_an_open_problem_has_no_sku(
     body = client.get("/bindings", headers=operator()).json()
 
     assert body["sku_changes"][0]["sku"] is None
+
+
+def decide(store: sqlite3.Connection, variant_id: str, item_code: str) -> None:
+    decision = Decision(
+        item_code=item_code,
+        explanation={"actual_qty": 5.0, "sellable": 3},
+        shopify_available=2,
+        last_pushed=2,
+        action="pushed",
+        note=None,
+    )
+    save_decisions(store, [(variant_id, decision)], NOW)
+
+
+def record_push(
+    store: sqlite3.Connection, variant_id: str, available: int, attempted_at: datetime
+) -> None:
+    store.execute(
+        "INSERT INTO push_history (variant_id, available, change_from,"
+        " idempotency_key, attempted_at, outcome) VALUES (?, ?, 1, 'test-key', ?, ?)",
+        (variant_id, available, utc_timestamp(attempted_at), PushOutcome.PUSHED),
+    )
+
+
+def get_record(client: httpx.Client, variant_id: str) -> httpx.Response:
+    return client.get("/record", params={"variant": variant_id}, headers=operator())
+
+
+def test_record_explains_a_bound_variant_with_its_push_history(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    bind(store, VARIANT, "TEST-ITEM-001")
+    decide(store, VARIANT, "TEST-ITEM-001")
+    record_push(store, VARIANT, 2, NOW)
+    record_push(store, VARIANT, 3, NOW + timedelta(seconds=1))
+    record_push(store, OTHER_VARIANT, 9, NOW)
+
+    response = get_record(client, VARIANT)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["variant_id"] == VARIANT
+    assert body["bound_item_code"] == "TEST-ITEM-001"
+    assert body["binding_problem"] is None
+    assert body["decision"] == {
+        "item_code": "TEST-ITEM-001",
+        "explanation": {"actual_qty": 5.0, "sellable": 3},
+        "shopify_available": 2,
+        "last_pushed": 2,
+        "action": "pushed",
+        "note": None,
+    }
+    assert body["push_history"] == [
+        {
+            "attempted_at": utc_timestamp(NOW + timedelta(seconds=1)),
+            "available": 3,
+            "change_from": 1,
+            "outcome": "pushed",
+        },
+        {
+            "attempted_at": utc_timestamp(NOW),
+            "available": 2,
+            "change_from": 1,
+            "outcome": "pushed",
+        },
+    ]
+
+
+def test_record_push_history_is_bounded_to_the_newest(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    bind(store, VARIANT, "TEST-ITEM-001")
+    for second in range(RECORD_PUSH_HISTORY + 1):
+        record_push(store, VARIANT, second, NOW + timedelta(seconds=second))
+
+    history = get_record(client, VARIANT).json()["push_history"]
+
+    assert len(history) == RECORD_PUSH_HISTORY
+    assert history[0]["available"] == RECORD_PUSH_HISTORY
+    assert history[-1]["available"] == 1
+
+
+def test_record_for_an_unbound_variant_says_why(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    record_check(
+        store,
+        ProblemKind.UNBOUND_SKU,
+        [
+            Problem(
+                ProblemKind.UNBOUND_SKU,
+                VARIANT,
+                {"SKU": "TEST-SKU-001", "Reason": "No ERPNext Item has this item code"},
+            )
+        ],
+        NOW,
+    )
+
+    response = get_record(client, VARIANT)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["bound_item_code"] is None
+    assert body["decision"] is None
+    assert body["binding_problem"]["key"] == f"unbound_sku:{VARIANT}"
+    assert body["binding_problem"]["details"]["Reason"] == (
+        "No ERPNext Item has this item code"
+    )
+
+
+def test_record_for_a_held_variant_keeps_its_last_decision(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    decide(store, VARIANT, "TEST-ITEM-001")
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+
+    body = get_record(client, VARIANT).json()
+
+    assert body["bound_item_code"] is None
+    assert body["binding_problem"]["kind"] == "changed_sku"
+    assert body["decision"]["item_code"] == "TEST-ITEM-001"
+
+
+def test_record_ignores_problems_other_than_binding(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    record_check(
+        store,
+        ProblemKind.OVERSELL,
+        [Problem(ProblemKind.OVERSELL, VARIANT, {"Item": "TEST-ITEM-001"})],
+        NOW,
+    )
+
+    assert get_record(client, VARIANT).status_code == 404
+
+
+def test_record_for_an_unknown_variant_is_not_found(client: httpx.Client) -> None:
+    response = get_record(client, VARIANT)
+
+    assert response.status_code == 404
+    assert response.json()["environment"] == "staging"
+    assert VARIANT in response.json()["error"]
+
+
+def test_record_without_a_variant_is_a_bad_request(client: httpx.Client) -> None:
+    response = client.get("/record", headers=operator())
+
+    assert response.status_code == 400
+    assert "variant" in response.json()["error"]

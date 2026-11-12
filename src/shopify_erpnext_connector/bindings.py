@@ -268,6 +268,13 @@ def load_bindings(connection: sqlite3.Connection) -> list[Binding]:
     return [Binding(*row) for row in rows]
 
 
+def bound_item_code(connection: sqlite3.Connection, variant_id: str) -> str | None:
+    row = connection.execute(
+        "SELECT item_code FROM bindings WHERE variant_id = ?", (variant_id,)
+    ).fetchone()
+    return None if row is None else row[0]
+
+
 @dataclass(frozen=True)
 class SkuChange:
     """A variant held unbound because its SKU changed since it was bound."""

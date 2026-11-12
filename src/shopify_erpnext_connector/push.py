@@ -343,6 +343,31 @@ def last_pushed_values(connection: sqlite3.Connection) -> dict[str, int]:
     return dict(rows)
 
 
+@dataclass(frozen=True)
+class PushAttempt:
+    """One entry of a variant's push history."""
+
+    attempted_at: str
+    available: int
+    change_from: int | None
+    outcome: PushOutcome
+
+
+def recent_pushes(
+    connection: sqlite3.Connection, variant_id: str, limit: int
+) -> list[PushAttempt]:
+    """The variant's `limit` newest push attempts, newest first."""
+    rows = connection.execute(
+        "SELECT attempted_at, available, change_from, outcome FROM push_history"
+        " WHERE variant_id = ? ORDER BY attempted_at DESC, id DESC LIMIT ?",
+        (variant_id, limit),
+    ).fetchall()
+    return [
+        PushAttempt(attempted_at, available, change_from, PushOutcome(outcome))
+        for attempted_at, available, change_from, outcome in rows
+    ]
+
+
 def drop_unbound_pending(connection: sqlite3.Connection) -> None:
     """Drop the pending values of variants no longer bound: they are never sent."""
     connection.execute(
