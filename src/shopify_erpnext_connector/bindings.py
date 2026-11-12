@@ -259,6 +259,15 @@ def load_previous(connection: sqlite3.Connection) -> dict[str, str]:
     return dict(rows.fetchall())
 
 
+def load_bindings(connection: sqlite3.Connection) -> list[Binding]:
+    """The stored bindings, ordered by item code."""
+    rows = connection.execute(
+        "SELECT variant_id, inventory_item_id, item_code FROM bindings"
+        " ORDER BY item_code"
+    ).fetchall()
+    return [Binding(*row) for row in rows]
+
+
 def save_bindings(
     connection: sqlite3.Connection, result: BindingResult, now: datetime
 ) -> None:
