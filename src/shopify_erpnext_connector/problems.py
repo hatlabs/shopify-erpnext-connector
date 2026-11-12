@@ -73,6 +73,16 @@ def problem_key(kind: ProblemKind, subject: str) -> str:
     return f"{kind}:{subject}"
 
 
+def parse_problem_key(key: str) -> tuple[ProblemKind, str] | None:
+    """The kind and subject `problem_key` made `key` from, if it is one."""
+    kind, _, subject = key.partition(":")
+    try:
+        parsed = ProblemKind(kind)
+    except ValueError:
+        return None
+    return (parsed, subject) if subject else None
+
+
 def show_command(kind: ProblemKind, subject: str) -> str:
     return f"{CLI_NAME} problems show {shlex.quote(problem_key(kind, subject))}"
 

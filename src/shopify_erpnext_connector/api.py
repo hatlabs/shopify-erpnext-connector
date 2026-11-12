@@ -32,10 +32,18 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import BaseServer
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from shopify_erpnext_connector.config import Config
-from shopify_erpnext_connector.problems import count_open_problems, count_unsent_emails
+from shopify_erpnext_connector.problems import (
+    StoredProblem,
+    count_open_problems,
+    count_unsent_emails,
+    get_problem,
+    open_problems,
+    parse_problem_key,
+    problem_key,
+)
 from shopify_erpnext_connector.push import unpushed_since
 from shopify_erpnext_connector.store import dry_run, utc_timestamp
 
@@ -119,6 +127,7 @@ class _Response:
 class _Request:
     connection: sqlite3.Connection
     operator: str | None
+    query: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -230,6 +239,22 @@ class ApiServer:
             },
         )
 
+    def problems(self, request: _Request) -> _Response:
+        problems = open_problems(request.connection)
+        return self.json(
+            HTTPStatus.OK, {"problems": [_problem_json(p) for p in problems]}
+        )
+
+    def problem(self, request: _Request) -> _Response:
+        key = request.query.get("key")
+        if key is None:
+            return self.error(HTTPStatus.BAD_REQUEST, "the key parameter is required")
+        parsed = parse_problem_key(key)
+        stored = None if parsed is None else get_problem(request.connection, *parsed)
+        if stored is None:
+            return self.error(HTTPStatus.NOT_FOUND, f"no problem {key}")
+        return self.json(HTTPStatus.OK, {"problem": _problem_json(stored)})
+
     def metrics(self, request: _Request) -> _Response:
         connection = request.connection
         now = self._clock()
@@ -305,7 +330,26 @@ class ApiServer:
 _ROUTES: Mapping[str, _Route] = {
     "/status": _Route("GET", _Access.OPERATOR, ApiServer.status),
     "/metrics": _Route("GET", _Access.METRICS, ApiServer.metrics),
+    "/problems": _Route("GET", _Access.OPERATOR, ApiServer.problems),
+    "/problem": _Route("GET", _Access.OPERATOR, ApiServer.problem),
 }
+
+
+def _problem_json(problem: StoredProblem) -> dict[str, object]:
+    return {
+        "key": problem_key(problem.kind, problem.subject),
+        "kind": problem.kind,
+        "subject": problem.subject,
+        "details": dict(problem.details),
+        "opened_at": problem.opened_at,
+        "resolved_at": problem.resolved_at,
+        "email": {
+            "pending": problem.email_pending,
+            "attempts": problem.email_attempts,
+            "last_attempt_at": problem.last_email_attempt_at,
+            "communication": problem.communication_name,
+        },
+    }
 
 
 def _bearer_token(authorization: str | None) -> bytes | None:
@@ -341,7 +385,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _respond(self) -> _Response:
         api = self._api
-        path = urlsplit(self.path).path
+        url = urlsplit(self.path)
+        path = url.path
         route = _ROUTES.get(path)
         if route is None:
             return api.error(HTTPStatus.NOT_FOUND, f"no such endpoint: {path}")
@@ -377,7 +422,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return api.error(HTTPStatus.CONFLICT, refusal)
         try:
             with closing(api.connect()) as connection:
-                return route.handle(api, _Request(connection, self._operator))
+                query = dict(parse_qsl(url.query))
+                return route.handle(api, _Request(connection, self._operator, query))
         except Exception:
             # The operator gets a JSON answer; the details go to the log only.
             _log.exception("%s %s failed", self.command, path)

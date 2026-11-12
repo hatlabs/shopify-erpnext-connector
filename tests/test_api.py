@@ -510,3 +510,112 @@ def test_audit_records_the_operator_and_action(store: sqlite3.Connection) -> Non
         "SELECT recorded_at, operator, action, detail FROM audit_log"
     ).fetchall()
     assert rows == [(utc_timestamp(NOW), "alice", "dry-run off", "was on")]
+
+
+def test_problems_lists_open_problems_with_their_email_state(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    record_check(
+        store,
+        ProblemKind.UNBOUND_SKU,
+        [Problem(ProblemKind.UNBOUND_SKU, VARIANT, {"SKU": "TEST-SKU-001"})],
+        NOW,
+    )
+    record_check(
+        store,
+        ProblemKind.OVERSELL,
+        [Problem(ProblemKind.OVERSELL, OTHER_VARIANT, {"Item": "TEST-ITEM-002"})],
+        NOW,
+    )
+    record_check(store, ProblemKind.OVERSELL, [], NOW + timedelta(seconds=1))
+
+    response = client.get("/problems", headers=operator())
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["environment"] == "staging"
+    assert body["problems"] == [
+        {
+            "key": f"unbound_sku:{VARIANT}",
+            "kind": "unbound_sku",
+            "subject": VARIANT,
+            "details": {"SKU": "TEST-SKU-001"},
+            "opened_at": utc_timestamp(NOW),
+            "resolved_at": None,
+            "email": {
+                "pending": True,
+                "attempts": 0,
+                "last_attempt_at": None,
+                "communication": None,
+            },
+        }
+    ]
+
+
+def test_problems_when_none_is_open(client: httpx.Client) -> None:
+    assert client.get("/problems", headers=operator()).json()["problems"] == []
+
+
+def test_problem_shows_one_by_its_key(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    record_check(
+        store,
+        ProblemKind.OVERSELL,
+        [
+            Problem(
+                ProblemKind.OVERSELL,
+                VARIANT,
+                {"Item": "TEST-ITEM-001"},
+                context={"Short by": "2"},
+            )
+        ],
+        NOW,
+    )
+
+    response = client.get(
+        "/problem", params={"key": f"oversell:{VARIANT}"}, headers=operator()
+    )
+
+    assert response.status_code == 200
+    problem = response.json()["problem"]
+    assert problem["key"] == f"oversell:{VARIANT}"
+    assert problem["details"] == {"Item": "TEST-ITEM-001", "Short by": "2"}
+
+
+def test_problem_shows_a_resolved_problem(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    record_check(
+        store,
+        ProblemKind.OVERSELL,
+        [Problem(ProblemKind.OVERSELL, VARIANT, {"Item": "TEST-ITEM-001"})],
+        NOW,
+    )
+    record_check(store, ProblemKind.OVERSELL, [], NOW + timedelta(seconds=1))
+
+    response = client.get(
+        "/problem", params={"key": f"oversell:{VARIANT}"}, headers=operator()
+    )
+
+    assert response.status_code == 200
+    resolved_at = response.json()["problem"]["resolved_at"]
+    assert resolved_at == utc_timestamp(NOW + timedelta(seconds=1))
+
+
+@pytest.mark.parametrize(
+    "key", [f"oversell:{VARIANT}", f"no_such_kind:{VARIANT}", "oversell"]
+)
+def test_problem_not_found(client: httpx.Client, key: str) -> None:
+    response = client.get("/problem", params={"key": key}, headers=operator())
+
+    assert response.status_code == 404
+    assert response.json()["environment"] == "staging"
+    assert key in response.json()["error"]
+
+
+def test_problem_without_a_key_is_a_bad_request(client: httpx.Client) -> None:
+    response = client.get("/problem", headers=operator())
+
+    assert response.status_code == 400
+    assert "key" in response.json()["error"]
