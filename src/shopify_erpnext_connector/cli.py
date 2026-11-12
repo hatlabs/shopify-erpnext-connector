@@ -143,10 +143,14 @@ def fetch(target: Target, path: str, params: Mapping[str, str]) -> JsonObject:
     return {str(key): value for key, value in document.items()}
 
 
+def _malformed(key: str) -> CliError:
+    return CliError(f"unexpected answer from the connector: bad {key!r}")
+
+
 def _field(document: JsonObject, key: str, kind: type[_T]) -> _T:
     value = document.get(key)
     if not isinstance(value, kind):
-        raise CliError(f"unexpected answer from the connector: bad {key!r}")
+        raise _malformed(key)
     return value
 
 
@@ -157,12 +161,71 @@ def _optional(document: JsonObject, key: str, kind: type[_T]) -> _T | None:
 def _number(document: JsonObject, key: str) -> float:
     value = document.get(key)
     if isinstance(value, bool) or not isinstance(value, int | float):
-        raise CliError(f"unexpected answer from the connector: bad {key!r}")
+        raise _malformed(key)
     return value
+
+
+def _as_object(value: object, key: str) -> JsonObject:
+    if not isinstance(value, dict):
+        raise _malformed(key)
+    return {str(k): v for k, v in value.items()}
+
+
+def _object(document: JsonObject, key: str) -> JsonObject:
+    return _as_object(document.get(key), key)
+
+
+def _optional_object(document: JsonObject, key: str) -> JsonObject | None:
+    return None if document.get(key) is None else _object(document, key)
+
+
+def _objects(document: JsonObject, key: str) -> list[JsonObject]:
+    return [_as_object(value, key) for value in _field(document, key, list)]
+
+
+def _details(problem: JsonObject) -> dict[str, str]:
+    return {name: str(value) for name, value in _object(problem, "details").items()}
+
+
+def _summary(details: Mapping[str, str]) -> str:
+    return "; ".join(f"{name}: {value}" for name, value in details.items())
+
+
+def _quantity(value: object) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
 
 
 def _on_off(value: bool) -> str:
     return "on" if value else "off"
+
+
+def _environment_line(document: JsonObject) -> str:
+    return f"Environment: {_field(document, 'environment', str)}"
+
+
+def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
+    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
+    return [
+        "  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip()
+        for row in [headers, *rows]
+    ]
+
+
+def _email_state(problem: JsonObject) -> str:
+    email = _object(problem, "email")
+    if email.get("pending"):
+        last = email.get("last_attempt_at") or "never"
+        state = f"pending, {email.get('attempts')} attempts, last {last}"
+    else:
+        state = "not pending"
+    communication = email.get("communication")
+    if communication is not None:
+        state += f", ERPNext Communication {communication}"
+    return state
 
 
 def _render_status(document: JsonObject) -> str:
@@ -174,7 +237,7 @@ def _render_status(document: JsonObject) -> str:
         last_pass = f"{last_pass_at} ({scope})"
     return "\n".join(
         [
-            f"Environment: {_field(document, 'environment', str)}",
+            _environment_line(document),
             f"Dry run: {_on_off(_field(document, 'dry_run', bool))}",
             f"Last pass: {last_pass}",
             f"Push lag: {_number(document, 'push_lag_seconds'):g} s",
@@ -182,6 +245,139 @@ def _render_status(document: JsonObject) -> str:
             f"Unsent emails: {_field(document, 'unsent_emails', int)}",
         ]
     )
+
+
+def _render_problems(document: JsonObject) -> str:
+    problems = _objects(document, "problems")
+    lines = [_environment_line(document)]
+    if not problems:
+        return "\n".join([*lines, "No open problems."])
+    lines.append(f"Open problems: {len(problems)}")
+    for problem in problems:
+        line = f"  {_field(problem, 'key', str)}  opened {problem.get('opened_at')}"
+        if _object(problem, "email").get("pending"):
+            line += "  email pending"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_problem(document: JsonObject) -> str:
+    problem = _object(document, "problem")
+    resolved_at = problem.get("resolved_at") or "no, still open"
+    details = [f"  {name}: {value}" for name, value in _details(problem).items()]
+    return "\n".join(
+        [
+            _environment_line(document),
+            f"Problem: {_field(problem, 'key', str)}",
+            f"Opened: {problem.get('opened_at')}",
+            f"Resolved: {resolved_at}",
+            *details,
+            f"Email: {_email_state(problem)}",
+        ]
+    )
+
+
+_BINDING_SECTIONS = (
+    ("Unbound variants", "unbound"),
+    ("Ambiguous variants", "ambiguous"),
+)
+
+
+def _render_bindings(document: JsonObject) -> str:
+    lines = [_environment_line(document)]
+    for title, key in _BINDING_SECTIONS:
+        problems = _objects(document, key)
+        lines.append(f"{title}: {len(problems) or 'none'}")
+        lines.extend(
+            f"  {problem.get('subject')}  {_summary(_details(problem))}"
+            for problem in problems
+        )
+    changes = _objects(document, "sku_changes")
+    lines.append(f"Held SKU changes: {len(changes) or 'none'}")
+    lines.extend(
+        f"  {change.get('variant_id')}  was bound to {change.get('bound_item_code')},"
+        f" SKU now {change.get('sku') or 'unknown'},"
+        f" held since {change.get('detected_at')}"
+        for change in changes
+    )
+    return "\n".join(lines)
+
+
+def _binding_line(document: JsonObject) -> str:
+    item_code = _optional(document, "bound_item_code", str)
+    if item_code is not None:
+        return f"Bound to: {item_code}"
+    problem = _optional_object(document, "binding_problem")
+    if problem is None:
+        return "Not bound"
+    return f"Not bound: {_summary(_details(problem))} (problem {problem.get('key')})"
+
+
+def _decision_lines(document: JsonObject) -> list[str]:
+    decision = _optional_object(document, "decision")
+    if decision is None:
+        return ["Last decision: none"]
+    explanation = _object(decision, "explanation")
+    lines = [
+        f"Last decision: item {decision.get('item_code')},"
+        f" action {decision.get('action')}",
+        *(f"  {name}: {_quantity(value)}" for name, value in explanation.items()),
+        f"  Shopify available: {_quantity(decision.get('shopify_available'))}",
+        f"  Last pushed: {_quantity(decision.get('last_pushed'))}",
+    ]
+    if decision.get("note"):
+        lines.append(f"  Note: {decision.get('note')}")
+    return lines
+
+
+def _history_lines(document: JsonObject) -> list[str]:
+    history = _objects(document, "push_history")
+    if not history:
+        return ["Push history: none"]
+    return [
+        "Push history, newest first:",
+        *(
+            f"  {push.get('attempted_at')}  {push.get('available')}"
+            f" (from {_quantity(push.get('change_from'))})  {push.get('outcome')}"
+            for push in history
+        ),
+    ]
+
+
+def _render_record(document: JsonObject) -> str:
+    return "\n".join(
+        [
+            _environment_line(document),
+            f"Variant: {document.get('variant_id')}",
+            _binding_line(document),
+            *_decision_lines(document),
+            *_history_lines(document),
+        ]
+    )
+
+
+_REPORT_COLUMNS = (
+    ("Variant", "variant_id"),
+    ("Item", "item_code"),
+    ("Shopify", "shopify_available"),
+    ("Computed", "computed"),
+    ("Old", "old_formula"),
+    ("Actual", "actual_qty"),
+    ("Reserved", "reserved_qty"),
+    ("Production", "reserved_qty_for_production"),
+    ("Planned", "planned_qty"),
+    ("Unmirrored", "unmirrored"),
+)
+
+
+def _render_report(document: JsonObject) -> str:
+    rows = _objects(document, "rows")
+    lines = [_environment_line(document)]
+    if not rows:
+        return "\n".join([*lines, "No bound variant has been computed yet."])
+    headers = [title for title, _ in _REPORT_COLUMNS]
+    cells = [[_quantity(row.get(key)) for _, key in _REPORT_COLUMNS] for row in rows]
+    return "\n".join([*lines, *_table(headers, cells)])
 
 
 @dataclass(frozen=True)
@@ -217,6 +413,34 @@ def _parser() -> argparse.ArgumentParser:
         "status", parents=[common], help="last pass, push lag, dry-run and problems"
     )
     status.set_defaults(read=_Read("/status", _render_status))
+    problems = commands.add_parser(
+        "problems", parents=[common], help="list open problems, or show one"
+    )
+    problems.set_defaults(read=_Read("/problems", _render_problems))
+    show = problems.add_subparsers(dest="action").add_parser(
+        "show", parents=[common], help="show one problem, open or resolved"
+    )
+    show.add_argument("key", help="the problem's kind:subject, as its email names it")
+    show.set_defaults(
+        read=_Read("/problem", _render_problem, lambda v: {"key": str(v["key"])})
+    )
+    commands.add_parser(
+        "bindings",
+        parents=[common],
+        help="unbound and ambiguous variants, and variants held after a SKU change",
+    ).set_defaults(read=_Read("/bindings", _render_bindings))
+    record = commands.add_parser(
+        "record",
+        parents=[common],
+        help="a variant's sellable stock explanation and push history",
+    )
+    record.add_argument("variant", help="the variant's GID")
+    record.set_defaults(
+        read=_Read("/record", _render_record, lambda v: {"variant": str(v["variant"])})
+    )
+    commands.add_parser(
+        "report", parents=[common], help="the cutover dry-run comparison"
+    ).set_defaults(read=_Read("/report", _render_report))
     return parser
 
 

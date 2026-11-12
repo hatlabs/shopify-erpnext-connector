@@ -1,9 +1,12 @@
 import json
 import os
+import shlex
 import socket
+import sqlite3
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -14,9 +17,21 @@ from helpers import make_config
 from shopify_erpnext_connector import cli
 from shopify_erpnext_connector.api import ENVIRONMENT_HEADER, ApiServer
 from shopify_erpnext_connector.config import ApiConfig, Environment, Secret
-from shopify_erpnext_connector.store import open_store
+from shopify_erpnext_connector.decisions import Decision, save_decisions
+from shopify_erpnext_connector.problems import (
+    Problem,
+    ProblemKind,
+    record_check,
+    show_command,
+)
+from shopify_erpnext_connector.push import PushOutcome
+from shopify_erpnext_connector.store import open_store, utc_timestamp
 
 CLI_NAME = "shopify-erpnext-connector"
+NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
+VARIANT = "gid://shopify/ProductVariant/1001"
+OTHER_VARIANT = "gid://shopify/ProductVariant/1002"
+NO_ITEM = "No ERPNext Item has this item code"
 OPERATOR_TOKEN = "test-operator-token"
 # Kept apart from its value so the fixture check's header pattern stays meaningful.
 AUTH_HEADER = "Authorization"
@@ -99,9 +114,21 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def api(tmp_path: Path) -> Iterator[ApiServer]:
-    store_path = tmp_path / "connector.sqlite3"
-    open_store(store_path).close()
+def store_path(tmp_path: Path) -> Path:
+    path = tmp_path / "connector.sqlite3"
+    open_store(path).close()
+    return path
+
+
+@pytest.fixture
+def store(store_path: Path) -> Iterator[sqlite3.Connection]:
+    connection = open_store(store_path)
+    yield connection
+    connection.close()
+
+
+@pytest.fixture
+def api(store_path: Path) -> Iterator[ApiServer]:
     config = make_config()
     config = replace(
         config,
@@ -120,6 +147,12 @@ def api(tmp_path: Path) -> Iterator[ApiServer]:
 @pytest.fixture
 def api_url(api: ApiServer) -> str:
     return f"http://127.0.0.1:{api.port}"
+
+
+@pytest.fixture
+def connected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api_url: str) -> None:
+    """The CLI's staging variables point at the running API."""
+    configure(monkeypatch, tmp_path, api_url)
 
 
 def run(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, str]:
@@ -450,3 +483,229 @@ def test_unreachable_connector_is_reported(
 
     assert code != 0
     assert url in err
+
+
+def unbound(store: sqlite3.Connection, variant_id: str, sku: str) -> None:
+    record_check(
+        store,
+        ProblemKind.UNBOUND_SKU,
+        [Problem(ProblemKind.UNBOUND_SKU, variant_id, {"SKU": sku, "Reason": NO_ITEM})],
+        NOW,
+    )
+
+
+def oversold(store: sqlite3.Connection, variant_id: str) -> None:
+    record_check(
+        store,
+        ProblemKind.OVERSELL,
+        [
+            Problem(
+                ProblemKind.OVERSELL,
+                variant_id,
+                {"Item": "TEST-ITEM-001"},
+                context={"Short by": "2"},
+            )
+        ],
+        NOW,
+    )
+
+
+def bind_and_decide(store: sqlite3.Connection, variant_id: str) -> None:
+    store.execute(
+        "INSERT INTO bindings (variant_id, inventory_item_id, item_code, bound_at)"
+        " VALUES (?, ?, 'TEST-ITEM-001', ?)",
+        (variant_id, variant_id + "-inventory", utc_timestamp(NOW)),
+    )
+    explanation = {
+        "actual_qty": 5.0,
+        "reserved_qty": 1.0,
+        "reserved_qty_for_production": 0.0,
+        "planned_qty": 2.0,
+        "unmirrored": 1,
+        "sellable": 3,
+        "old_formula": 4,
+    }
+    decision = Decision("TEST-ITEM-001", explanation, 2, 2, "pushed", None)
+    save_decisions(store, [(variant_id, decision)], NOW)
+    store.execute(
+        "INSERT INTO push_history (variant_id, available, change_from,"
+        " idempotency_key, attempted_at, outcome) VALUES (?, 3, 2, 'test-key', ?, ?)",
+        (variant_id, utc_timestamp(NOW), PushOutcome.PUSHED),
+    )
+
+
+@pytest.mark.usefixtures("connected")
+def test_problems_lists_the_open_problems(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    unbound(store, VARIANT, "TEST-SKU-001")
+    oversold(store, OTHER_VARIANT)
+
+    code, out, err = run(capsys, "problems")
+
+    assert code == 0, err
+    assert "staging" in out
+    assert f"unbound_sku:{VARIANT}" in out
+    assert f"oversell:{OTHER_VARIANT}" in out
+    assert "email pending" in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_problems_when_none_is_open(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = run(capsys, "problems")
+
+    assert code == 0
+    assert "No open problems" in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_the_command_in_a_problem_email_shows_the_problem(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    oversold(store, VARIANT)
+    program, *argv = shlex.split(show_command(ProblemKind.OVERSELL, VARIANT))
+
+    code, out, err = run(capsys, *argv)
+
+    assert program == CLI_NAME
+    assert code == 0, err
+    assert f"oversell:{VARIANT}" in out
+    assert "Item: TEST-ITEM-001" in out
+    assert "Short by: 2" in out
+    assert f"Opened: {utc_timestamp(NOW)}" in out
+    assert "Email: pending" in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_problems_show_of_an_unknown_problem_is_not_found(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, out, err = run(capsys, "problems", "show", f"oversell:{VARIANT}")
+
+    assert code != 0
+    assert out == ""
+    assert f"no problem oversell:{VARIANT}" in err
+
+
+@pytest.mark.usefixtures("connected")
+def test_problems_as_json(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    oversold(store, VARIANT)
+
+    code, out, _ = run(capsys, "problems", "--json")
+
+    assert code == 0
+    assert json.loads(out)["problems"][0]["key"] == f"oversell:{VARIANT}"
+
+
+@pytest.mark.usefixtures("connected")
+def test_bindings_shows_unbound_ambiguous_and_held_variants(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    held = "gid://shopify/ProductVariant/1003"
+    unbound(store, VARIANT, "TEST-SKU-001")
+    record_check(
+        store,
+        ProblemKind.AMBIGUOUS_SKU,
+        [Problem(ProblemKind.AMBIGUOUS_SKU, OTHER_VARIANT, {"SKU": "TEST-SKU-002"})],
+        NOW,
+    )
+    store.execute(
+        "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
+        " VALUES (?, 'TEST-ITEM-003', ?)",
+        (held, utc_timestamp(NOW)),
+    )
+    record_check(
+        store,
+        ProblemKind.CHANGED_SKU,
+        [Problem(ProblemKind.CHANGED_SKU, held, {"SKU": "TEST-SKU-003-NEW"})],
+        NOW,
+    )
+
+    code, out, err = run(capsys, "bindings")
+
+    assert code == 0, err
+    unbound_part, rest = out.split("Ambiguous")
+    ambiguous_part, held_part = rest.split("Held")
+    assert VARIANT in unbound_part
+    assert NO_ITEM in unbound_part
+    assert OTHER_VARIANT in ambiguous_part
+    assert held in held_part
+    assert "TEST-ITEM-003" in held_part
+    assert "TEST-SKU-003-NEW" in held_part
+
+
+@pytest.mark.usefixtures("connected")
+def test_bindings_when_every_variant_is_bound(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, out, _ = run(capsys, "bindings")
+
+    assert code == 0
+    assert VARIANT not in out
+    assert "Unbound variants: none" in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_record_explains_a_bound_variant(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bind_and_decide(store, VARIANT)
+
+    code, out, err = run(capsys, "record", VARIANT)
+
+    assert code == 0, err
+    assert "Bound to: TEST-ITEM-001" in out
+    assert "sellable: 3" in out
+    assert "reserved_qty: 1" in out
+    assert "Shopify available: 2" in out
+    assert f"{utc_timestamp(NOW)}  3 (from 2)  pushed" in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_record_for_an_unbound_variant_says_it_is_unbound_and_why(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    unbound(store, VARIANT, "TEST-SKU-001")
+
+    code, out, err = run(capsys, "record", VARIANT)
+
+    assert code == 0, err
+    assert "Not bound" in out
+    assert NO_ITEM in out
+    assert f"unbound_sku:{VARIANT}" in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_record_for_an_unknown_variant_is_not_found(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, out, err = run(capsys, "record", VARIANT)
+
+    assert code != 0
+    assert out == ""
+    assert f"no record of variant {VARIANT}" in err
+
+
+@pytest.mark.usefixtures("connected")
+def test_report_compares_the_computed_values(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bind_and_decide(store, VARIANT)
+
+    code, out, err = run(capsys, "report")
+
+    assert code == 0, err
+    header, row = out.splitlines()[-2:]
+    assert header.split()[:4] == ["Variant", "Item", "Shopify", "Computed"]
+    quantities = ["2", "3", "4", "5", "1", "0", "2", "1"]
+    assert row.split() == [VARIANT, "TEST-ITEM-001", *quantities]
+
+
+@pytest.mark.usefixtures("connected")
+def test_report_before_any_computation(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = run(capsys, "report")
+
+    assert code == 0
+    assert "No bound variant has been computed yet" in out
