@@ -5,7 +5,8 @@ writes with explicit `BEGIN` and `COMMIT`.
 
 Connector timestamps are UTC text from `utc_timestamp`, fixed width so that
 text order is time order. The watermark is the exception: it holds ERPNext's
-own Bin `modified` value verbatim, a naive time in the site's time zone.
+own Bin `modified` value, a naive time in the site's time zone, written
+with six fractional digits.
 
 Identifiers are text: Shopify GIDs and ERPNext item codes.
 """
