@@ -45,6 +45,7 @@ STATUS = {
     "dry_run": False,
     "last_pass_at": "2026-11-13T10:00:00.000000Z",
     "last_pass_full": True,
+    "last_full_pass_at": "2026-11-13T09:00:00.000000Z",
     "push_lag_seconds": 0,
     "open_problems": 0,
     "unsent_emails": 0,
@@ -225,6 +226,7 @@ def test_status_against_the_connector(
     assert "staging" in out
     assert "Dry run: on" in out
     assert "Last pass: none yet" in out
+    assert "Last full pass: none yet" in out
     assert OPERATOR_TOKEN not in out + err
 
 
@@ -248,6 +250,7 @@ def test_status_after_a_completed_full_pass(
     assert code == 0, err
     lines = out.splitlines()
     assert f"Last pass: {STATUS['last_pass_at']} (full)" in lines
+    assert f"Last full pass: {STATUS['last_full_pass_at']}" in lines
     assert "Push lag: 42.5 s" in lines
     assert "Open problems: 3" in lines
     assert "Unsent emails: 1" in lines

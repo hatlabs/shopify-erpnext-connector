@@ -236,11 +236,13 @@ def _render_status(document: JsonObject) -> str:
     else:
         scope = "full" if _field(document, "last_pass_full", bool) else "incremental"
         last_pass = f"{last_pass_at} ({scope})"
+    last_full_pass = _optional(document, "last_full_pass_at", str) or "none yet"
     return "\n".join(
         [
             _environment_line(document),
             f"Dry run: {_on_off(_field(document, 'dry_run', bool))}",
             f"Last pass: {last_pass}",
+            f"Last full pass: {last_full_pass}",
             f"Push lag: {_number(document, 'push_lag_seconds'):g} s",
             f"Open problems: {_field(document, 'open_problems', int)}",
             f"Unsent emails: {_field(document, 'unsent_emails', int)}",
