@@ -119,9 +119,7 @@ def fetch(target: Target, path: str, params: Mapping[str, str]) -> JsonObject:
             f"{url_variable(target.environment)} is not a valid URL: {error}"
         ) from None
     except httpx.HTTPError as error:
-        raise CliError(
-            f"cannot reach the {target.environment} connector at {target.url}: {error}"
-        ) from None
+        raise CliError(f"cannot reach the connector at {target.url}: {error}") from None
     try:
         document: object = response.json()
     except ValueError:
@@ -138,10 +136,7 @@ def fetch(target: Target, path: str, params: Mapping[str, str]) -> JsonObject:
             f"{target.environment}; check {url_variable(target.environment)}"
         )
     if response.status_code == HTTPStatus.UNAUTHORIZED:
-        raise CliError(
-            f"the {target.environment} connector rejected the token in "
-            f"{target.token_file}"
-        )
+        raise CliError(f"the connector rejected the token in {target.token_file}")
     if response.is_error:
         raise CliError(
             f"the connector answered {response.status_code}: {document.get('error')}"
@@ -466,6 +461,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         target = resolve_target(
             env_option if isinstance(env_option, str) else None, os.environ
         )
+    except CliError as error:
+        return _fail(str(error))
+    try:
         document = fetch(target, read.path, read.params(values))
         output = (
             json.dumps(document, indent=2)
@@ -473,7 +471,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             else read.render(document)
         )
     except CliError as error:
-        print(f"{CLI_NAME}: {error}", file=sys.stderr)
-        return EXIT_FAILURE
+        # Named so that an answer such as "no problem" cannot be read as
+        # coming from the environment the operator meant to ask.
+        return _fail(f"{target.environment}: {error}")
     print(output)
     return os.EX_OK
+
+
+def _fail(message: str) -> int:
+    print(f"{CLI_NAME}: {message}", file=sys.stderr)
+    return EXIT_FAILURE

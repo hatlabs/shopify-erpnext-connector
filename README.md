@@ -41,7 +41,7 @@ CONNECTOR_PRODUCTION_URL=https://connector.example.com
 CONNECTOR_PRODUCTION_TOKEN_FILE=/path/to/production-operator-token
 ```
 
-`--env staging` or `--env production` selects the environment; without it, `CONNECTOR_ENV` does, and then staging. Every answer names the connector's environment, and the CLI fails when it is not the one selected.
+`--env staging` or `--env production` selects the environment; without it, `CONNECTOR_ENV` does, and then staging. Every answer names the connector's environment, and the CLI fails when it is not the one selected. An error about a request or an answer starts with the environment asked, as in `production: the connector answered 404: ...`.
 
 | Command | Shows |
 |---|---|

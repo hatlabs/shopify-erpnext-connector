@@ -529,6 +529,41 @@ def test_answer_missing_a_required_field_is_reported(
     assert "bad 'dry_run'" in err
 
 
+@pytest.mark.parametrize(
+    ("status", "document"),
+    [
+        (404, {"environment": "production", "error": "no problem"}),
+        (500, {"environment": "production", "error": "the request failed"}),
+        (401, {"environment": "production", "error": "unauthorized"}),
+        (200, {"environment": "staging"} | STATUS),
+        (200, {"environment": "production"}),
+        (502, None),
+    ],
+)
+def test_errors_about_an_answer_name_the_environment_asked(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+    status: int,
+    document: dict[str, object] | None,
+) -> None:
+    state, url = canned
+    if document is None:
+        state.status = status
+        state.body = b"<html>Bad Gateway</html>"
+    else:
+        state.answer(status, document)
+    configure(monkeypatch, tmp_path, url, "production")
+    monkeypatch.setenv("CONNECTOR_ENV", "production")
+
+    code, out, err = run(capsys, "status")
+
+    assert code == cli.EXIT_FAILURE
+    assert out == ""
+    assert err.startswith(f"{CLI_NAME}: production: ")
+
+
 def test_unreachable_connector_is_reported(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -541,6 +576,7 @@ def test_unreachable_connector_is_reported(
     code, _, err = run(capsys, "status")
 
     assert code != 0
+    assert err.startswith(f"{CLI_NAME}: staging: ")
     assert url in err
 
 
@@ -553,6 +589,7 @@ def test_malformed_url_is_reported_naming_its_variable(
 
     assert code == cli.EXIT_FAILURE
     assert out == ""
+    assert err.startswith(f"{CLI_NAME}: staging: ")
     assert "CONNECTOR_STAGING_URL" in err
     assert len(err.splitlines()) == 1
 
@@ -720,7 +757,7 @@ def test_problems_show_of_an_unknown_problem_is_not_found(
 
     assert code != 0
     assert out == ""
-    assert f"no problem oversell:{VARIANT}" in err
+    assert f"staging: the connector answered 404: no problem oversell:{VARIANT}" in err
 
 
 @pytest.mark.usefixtures("connected")
