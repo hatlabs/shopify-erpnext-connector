@@ -1006,6 +1006,10 @@ def probe(monkeypatch: pytest.MonkeyPatch, worker: FakeWorker) -> list[object]:
             return server.error(HTTPStatus.NOT_FOUND, "probe refused")
         if request.body.get("raise"):
             raise RuntimeError("probe failed")
+        if request.body.get("abort"):
+            # As SQLite does on its own after a disk-full or I/O error.
+            request.connection.execute("ROLLBACK")
+            raise RuntimeError("probe failed after the transaction ended")
         return server.json(HTTPStatus.OK, {"done": True})
 
     monkeypatch.setitem(
@@ -1044,6 +1048,22 @@ def test_a_failed_mutation_writes_nothing_and_releases_the_lock(
 
     assert response.status_code == 500
     assert response.json()["environment"] == "staging"
+    assert audit_rows(store) == []
+    assert not worker.writer_lock.locked()
+
+
+def test_a_mutation_whose_transaction_already_ended_logs_its_own_error(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    probe: list[object],
+    logs: pytest.LogCaptureFixture,
+) -> None:
+    response = client.post("/probe", json={"abort": True}, headers=operator())
+
+    assert response.status_code == 500
+    assert "probe failed after the transaction ended" in logs.text
+    assert "no transaction is active" not in logs.text
     assert audit_rows(store) == []
     assert not worker.writer_lock.locked()
 

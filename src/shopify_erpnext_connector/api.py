@@ -282,7 +282,9 @@ class ApiServer:
         try:
             response = route.handle(self, request)
         except BaseException:
-            connection.execute("ROLLBACK")
+            # SQLite may have rolled back on its own, as after a disk-full error.
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
             raise
         refused = response.status >= HTTPStatus.BAD_REQUEST
         connection.execute("ROLLBACK" if refused else "COMMIT")
