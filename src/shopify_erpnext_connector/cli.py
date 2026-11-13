@@ -538,7 +538,10 @@ def _render_rerun(document: JsonObject) -> str:
         return "\n".join([*lines, *unfinished])
     resolved_at = _optional(_object(document, "problem"), "resolved_at", str)
     state = "still open" if resolved_at is None else f"cleared at {resolved_at}"
-    return "\n".join([*lines, f"After a full pass: {state}"])
+    lines.append(f"After a full pass: {state}")
+    if _field(document, "dry_run", bool):
+        lines.append("Dry run is on: rechecked, nothing pushed.")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)

@@ -1908,5 +1908,6 @@ def test_push_and_rerun_wait_for_the_running_loops_pass(world: World) -> None:
     assert world.shopify.available(1) == 3
     rerun = answers["rerun"].json()
     assert rerun["pass"] == PassResult.COMPLETED
+    assert rerun["dry_run"] is False
     assert rerun["problem"]["resolved_at"] is not None
     assert world.shopify.available(2) == 4

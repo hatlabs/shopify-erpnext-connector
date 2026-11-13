@@ -1463,6 +1463,7 @@ def test_a_pass_that_ended_early_is_reported_as_such(
 def test_rerun_reports_a_cleared_problem(
     store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    set_dry_run(store, False)
     unbound(store, VARIANT, "TEST-SKU-001")
     later = NOW + timedelta(minutes=5)
     record_check(store, ProblemKind.UNBOUND_SKU, [], later)
@@ -1482,12 +1483,28 @@ def test_rerun_reports_a_cleared_problem(
 def test_rerun_reports_a_problem_still_open(
     store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    set_dry_run(store, False)
     unbound(store, VARIANT, "TEST-SKU-001")
 
     code, out, err = run(capsys, "rerun", f"unbound_sku:{VARIANT}")
 
     assert code == 0, err
     assert out.splitlines()[-1] == "After a full pass: still open"
+
+
+@pytest.mark.usefixtures("connected")
+def test_rerun_in_dry_run_says_nothing_was_pushed(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    unbound(store, VARIANT, "TEST-SKU-001")
+
+    code, out, err = run(capsys, "rerun", f"unbound_sku:{VARIANT}")
+
+    assert code == 0, err
+    assert out.splitlines()[-2:] == [
+        "After a full pass: still open",
+        "Dry run is on: rechecked, nothing pushed.",
+    ]
 
 
 @pytest.mark.usefixtures("connected")

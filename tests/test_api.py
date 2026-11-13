@@ -1661,6 +1661,7 @@ def test_rerun_asks_for_a_full_pass_and_reports_the_problem_cleared(
     assert response.status_code == 200
     body = response.json()
     assert body["pass"] == "completed"
+    assert body["dry_run"] is True
     assert body["key"] == body["problem"]["key"] == UNBOUND_KEY
     assert body["problem"]["resolved_at"] == utc_timestamp(later)
     assert worker.requests == [PassRequest(full=True, items=())]
@@ -1677,6 +1678,44 @@ def test_rerun_reports_a_problem_still_open(
 
     assert body["pass"] == "completed"
     assert body["problem"]["resolved_at"] is None
+
+
+def open_stale_push(connection: sqlite3.Connection) -> str:
+    location = make_config().location_id
+    record_check(
+        connection,
+        ProblemKind.STALE_PUSH,
+        [Problem(ProblemKind.STALE_PUSH, location, {})],
+        NOW,
+    )
+    return f"{ProblemKind.STALE_PUSH}:{location}"
+
+
+def test_rerun_of_a_stale_push_in_dry_run_is_a_conflict_and_changes_nothing(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    key = open_stale_push(store)
+
+    response = rerun(client, key)
+
+    assert response.status_code == 409
+    assert "dry run" in response.json()["error"]
+    assert audit_rows(store) == []
+    assert worker.requests == []
+    assert worker.waits == []
+
+
+def test_rerun_of_a_stale_push_with_dry_run_off_asks_for_a_pass(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    set_dry_run(store, False)
+    key = open_stale_push(store)
+
+    body = rerun(client, key).json()
+
+    assert body["pass"] == "completed"
+    assert body["dry_run"] is False
+    assert worker.requests == [PassRequest(full=True, items=())]
 
 
 def test_a_rerun_whose_pass_does_not_end_in_time_is_still_accepted(

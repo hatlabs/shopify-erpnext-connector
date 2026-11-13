@@ -598,6 +598,12 @@ class ApiServer:
         parsed = parse_problem_key(key)
         if parsed is None or get_problem(connection, *parsed) is None:
             return self.error(HTTPStatus.NOT_FOUND, f"no problem {key}")
+        if parsed[0] is ProblemKind.STALE_PUSH and dry_run(connection):
+            return self.error(
+                HTTPStatus.CONFLICT,
+                "dry run is on, and a pass in dry run does not check stale pushes;"
+                " turn dry run off to recheck it",
+            )
         self.audit_mutation(request, RERUN_ACTION, {"key": key})
         ticket = self._worker.request_pass(full=True)
 
@@ -609,6 +615,7 @@ class ApiServer:
                 HTTPStatus.OK,
                 {
                     "key": key,
+                    "dry_run": dry_run(connection),
                     "pass": result,
                     "problem": _problem_json(problem),
                 },
