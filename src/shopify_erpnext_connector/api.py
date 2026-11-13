@@ -44,7 +44,7 @@ from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import BaseServer
-from typing import Protocol
+from typing import Protocol, TypeVar
 from urllib.parse import parse_qsl, urlsplit
 
 from shopify_erpnext_connector.bindings import (
@@ -207,13 +207,25 @@ class _Request:
     body: Mapping[str, object] = field(default_factory=dict)
 
 
+_Result = TypeVar("_Result", bound=_Response | _Waiting)
+
+
 @dataclass(frozen=True)
 class _Route:
     method: str
     access: _Access
-    handle: Callable[["ApiServer", _Request], _Response | _Waiting]
+    handle: Callable[["ApiServer", _Request], _Response]
     # Whether a mutation waits for the worker's writer lock.
     writer_lock: bool = True
+
+
+@dataclass(frozen=True)
+class _WaitingRoute:
+    """A mutation that asks for a pass and waits for it; it takes the writer lock."""
+
+    method: str
+    access: _Access
+    handle: Callable[["ApiServer", _Request], _Response | _Waiting]
 
 
 class ApiServer:
@@ -295,24 +307,17 @@ class ApiServer:
         return None
 
     def mutate(self, route: _Route, request: _Request) -> _Response:
-        """Run a mutation in one transaction, under the writer lock if it takes it.
-
-        A mutation that waits for a pass waits after the lock is released,
-        since the pass needs it.
-        """
+        """Run a mutation in one transaction, under the writer lock if it takes it."""
         if not route.writer_lock:
-            result = self._transact(route, request)
-        else:
-            lock = self._worker.writer_lock
-            if not lock.acquire(timeout=self.writer_lock_timeout):
-                return self.error(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    "a pass is running; retry the command in a moment",
-                )
-            try:
-                result = self._transact(route, request)
-            finally:
-                lock.release()
+            return self._transact(route.handle, request)
+        return self._locked(route.handle, request)
+
+    def mutate_and_wait(self, route: _WaitingRoute, request: _Request) -> _Response:
+        """Run a mutation as `mutate` does, then wait for the pass it asked for.
+
+        The wait comes after the lock is released, since the pass needs it.
+        """
+        result = self._locked(route.handle, request)
         if isinstance(result, _Response):
             return result
         outcome = self._worker.wait_for_pass(result.ticket, self.pass_wait_timeout)
@@ -323,12 +328,28 @@ class ApiServer:
         finally:
             connection.rollback()
 
-    def _transact(self, route: _Route, request: _Request) -> _Response | _Waiting:
+    def _locked(
+        self, handle: Callable[["ApiServer", _Request], _Result], request: _Request
+    ) -> _Result | _Response:
+        lock = self._worker.writer_lock
+        if not lock.acquire(timeout=self.writer_lock_timeout):
+            return self.error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "a pass is running; retry the command in a moment",
+            )
+        try:
+            return self._transact(handle, request)
+        finally:
+            lock.release()
+
+    def _transact(
+        self, handle: Callable[["ApiServer", _Request], _Result], request: _Request
+    ) -> _Result:
         connection = request.connection
         # IMMEDIATE: what the handler reads cannot change before it writes.
         connection.execute("BEGIN IMMEDIATE")
         try:
-            result = route.handle(self, request)
+            result = handle(self, request)
         except BaseException:
             # SQLite may have rolled back on its own, as after a disk-full error.
             if connection.in_transaction:
@@ -708,7 +729,7 @@ class ApiServer:
         return max(0.0, (self._clock() - oldest).total_seconds())
 
 
-_ROUTES: Mapping[str, _Route] = {
+_ROUTES: Mapping[str, _Route | _WaitingRoute] = {
     "/status": _Route("GET", _Access.OPERATOR, ApiServer.status),
     "/metrics": _Route("GET", _Access.METRICS, ApiServer.metrics),
     "/problems": _Route("GET", _Access.OPERATOR, ApiServer.problems),
@@ -722,8 +743,8 @@ _ROUTES: Mapping[str, _Route] = {
     "/bindings/accept-sku-change": _Route(
         "POST", _Access.OPERATOR, ApiServer.accept_sku_change
     ),
-    "/push": _Route("POST", _Access.OPERATOR, ApiServer.push),
-    "/rerun": _Route("POST", _Access.OPERATOR, ApiServer.rerun),
+    "/push": _WaitingRoute("POST", _Access.OPERATOR, ApiServer.push),
+    "/rerun": _WaitingRoute("POST", _Access.OPERATOR, ApiServer.rerun),
 }
 
 
@@ -859,18 +880,17 @@ class _Handler(BaseHTTPRequestHandler):
             with closing(api.connect()) as connection:
                 query = dict(parse_qsl(url.query))
                 request = _Request(connection, self._operator, query, body)
+                if isinstance(route, _WaitingRoute):
+                    return api.mutate_and_wait(route, request)
                 if route.method != "GET":
                     return api.mutate(route, request)
                 # One read transaction, so every statement of the handler sees
                 # the same WAL snapshot even while the worker commits a pass.
                 connection.execute("BEGIN")
                 try:
-                    response = route.handle(api, request)
+                    return route.handle(api, request)
                 finally:
                     connection.rollback()
-                # Only mutations wait for a pass.
-                assert isinstance(response, _Response)
-                return response
         except Exception:
             # The operator gets a JSON answer; the details go to the log only.
             _log.exception("%s %s failed", self.command, path)
