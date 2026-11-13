@@ -411,6 +411,39 @@ def test_empty_token_file_is_an_error_naming_it(
     assert "empty" in err
 
 
+def test_token_that_cannot_be_sent_is_an_error_naming_only_its_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    _, url = canned
+    token_file = configure(monkeypatch, tmp_path, url, token="test-op\nerator\n")
+
+    code, _, err = run(capsys, "status")
+
+    assert code != 0
+    assert str(token_file) in err
+    assert "test-op" not in err.replace(str(token_file), "")
+
+
+def test_redirect_is_not_a_successful_answer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    state, url = canned
+    state.answer(302, {"environment": "staging"} | STATUS)
+    configure(monkeypatch, tmp_path, url)
+
+    code, out, err = run(capsys, "status", "--json")
+
+    assert code != 0
+    assert out == ""
+    assert "302" in err
+
+
 def test_response_for_another_environment_is_refused(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -852,6 +885,25 @@ def test_record_for_an_unbound_variant_says_it_is_unbound_and_why(
     assert "Not bound" in out
     assert NO_ITEM in out
     assert f"unbound_sku:{VARIANT}" in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_record_for_a_held_variant_without_a_problem_names_the_hold(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store.execute(
+        "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
+        " VALUES (?, 'TEST-ITEM-001', ?)",
+        (VARIANT, utc_timestamp(NOW)),
+    )
+
+    code, out, err = run(capsys, "record", VARIANT)
+
+    assert code == 0, err
+    assert (
+        "Not bound: SKU changed since it was bound to TEST-ITEM-001"
+        f" (detected {utc_timestamp(NOW)})"
+    ) in out.splitlines()
 
 
 @pytest.mark.usefixtures("connected")

@@ -12,6 +12,7 @@ at the wrong connector fails instead of showing its data.
 import argparse
 import json
 import os
+import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -36,6 +37,8 @@ SERVE_COMMAND = "serve"
 DEFAULT_ENVIRONMENT = Environment.STAGING
 REQUEST_TIMEOUT_SECONDS = 30.0
 EXIT_FAILURE = 1
+# Visible ASCII: what an HTTP header value can carry unchanged.
+_BEARER_TOKEN = re.compile(r"[!-~]+")
 
 JsonObject = Mapping[str, object]
 _T = TypeVar("_T")
@@ -88,6 +91,11 @@ def resolve_target(env_option: str | None, environ: Mapping[str, str]) -> Target
         token = read_secret(token_file)
     except ConfigError as error:
         raise CliError(f"operator token: {error}") from None
+    # The transport's error for an illegal header value quotes the value.
+    if not _BEARER_TOKEN.fullmatch(token.reveal()):
+        raise CliError(
+            f"operator token: {token_file} holds characters a bearer token cannot carry"
+        )
     return Target(
         environment, env_option is not None, url.rstrip("/"), token_file, token
     )
@@ -137,7 +145,7 @@ def fetch(target: Target, path: str, params: Mapping[str, str]) -> JsonObject:
         )
     if response.status_code == HTTPStatus.UNAUTHORIZED:
         raise CliError(f"the connector rejected the token in {target.token_file}")
-    if response.is_error:
+    if not response.is_success:
         raise CliError(
             f"the connector answered {response.status_code}: {document.get('error')}"
         )
@@ -311,9 +319,17 @@ def _binding_line(document: JsonObject) -> str:
     if item_code is not None:
         return f"Bound to: {item_code}"
     problem = _optional_object(document, "binding_problem")
-    if problem is None:
+    if problem is not None:
+        return (
+            f"Not bound: {_summary(_details(problem))} (problem {problem.get('key')})"
+        )
+    change = _optional_object(document, "sku_change")
+    if change is None:
         return "Not bound"
-    return f"Not bound: {_summary(_details(problem))} (problem {problem.get('key')})"
+    return (
+        "Not bound: SKU changed since it was bound to"
+        f" {change.get('bound_item_code')} (detected {change.get('detected_at')})"
+    )
 
 
 def _decision_lines(document: JsonObject) -> list[str]:
