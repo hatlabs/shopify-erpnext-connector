@@ -566,10 +566,22 @@ def _binding_details(variant: UnboundVariant) -> dict[str, str]:
         SKU_DETAIL: variant.sku or NO_SKU,
         "Reason": _BINDING_REASONS[variant.kind],
     }
+    if variant.kind is not UnboundKind.SKU_CHANGED:
+        return details | _related_details(variant)
+    details["Bound item"] = variant.item_codes[0]
+    blocker = variant.accepted_unbound
+    if blocker is not None:
+        reason = _BINDING_REASONS[blocker.kind]
+        details["Accepted SKU"] = f"Does not bind yet: {reason}"
+        details |= _related_details(blocker)
+    return details
+
+
+def _related_details(variant: UnboundVariant) -> dict[str, str]:
+    """The Items and variants that keep `variant` from binding."""
+    details: dict[str, str] = {}
     if variant.kind is UnboundKind.NEAR_MATCH:
         details["Similar item codes"] = ", ".join(variant.item_codes)
-    elif variant.kind is UnboundKind.SKU_CHANGED:
-        details["Bound item"] = variant.item_codes[0]
     elif variant.item_codes:
         details["Item"] = variant.item_codes[0]
     if variant.other_variant_ids:

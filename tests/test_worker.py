@@ -1543,3 +1543,36 @@ def test_a_sku_changed_again_after_acceptance_stays_held(world: World) -> None:
         "SELECT bound_item_code, accepted_sku FROM sku_changes"
     ).fetchall()
     assert held == [(item_code(9), None)]
+
+
+def test_an_accepted_sku_with_no_item_stays_held_until_its_item_exists(
+    world: World,
+) -> None:
+    world.bind(9, actual=4, available=0)
+    world.worker.run_pass(NOW)
+    world.shopify.set_sku(9, item_code(10))
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL)
+    assert accept_sku_change(world, 9).status_code == 200
+
+    world.worker.run_pass(NOW + 2 * FULL_PASS_INTERVAL)
+
+    assert world.worker.last_pass_full
+    assert bound_item_code(world.store, variant_id(9)) is None
+    assert world.open_of(ProblemKind.UNBOUND_SKU) == []
+    problem = get_problem(world.store, ProblemKind.CHANGED_SKU, variant_id(9))
+    assert problem is not None
+    assert problem.resolved_at is None
+    assert problem.details == {
+        SKU_DETAIL: item_code(10),
+        "Reason": "The SKU changed since the variant was bound",
+        "Bound item": item_code(9),
+        "Accepted SKU": "Does not bind yet: No ERPNext Item has this item code",
+    }
+
+    world.erpnext.add_item(item_code(10))
+    world.erpnext.set_bin(item_code(10), actual=2)
+    world.worker.run_pass(NOW + 3 * FULL_PASS_INTERVAL)
+
+    assert bound_item_code(world.store, variant_id(9)) == item_code(10)
+    assert world.open_of(ProblemKind.CHANGED_SKU) == []
+    assert world.shopify.available(9) == 2

@@ -10,7 +10,9 @@ A bound variant whose SKU changes stays unbound and reported until its SKU is
 restored, an operator accepts the new SKU or it leaves the push set: a changed
 SKU may name a different product, so the connector does not follow it on its
 own. An accepted SKU binds only while the variant still has it; a SKU changed
-again before the next full pass keeps the hold and drops the acceptance. A
+again before the next full pass keeps the hold and drops the acceptance. An
+accepted SKU that cannot bind yet, such as one with no Item, keeps both the
+hold and the acceptance until it can. A
 variant that lost its binding for another reason, such as a disabled Item,
 keeps no record of it, so a later SKU change binds like a new variant.
 """
@@ -93,6 +95,8 @@ class UnboundVariant:
     `item_codes` holds the Item involved: the matching Item for the Item
     checks, the candidates for a near match, the previously bound Item for a
     SKU change. `other_variant_ids` holds the variants sharing a duplicate SKU.
+    `accepted_unbound` says, for a SKU change whose new SKU an operator
+    accepted, why that SKU does not bind yet.
     """
 
     kind: UnboundKind
@@ -100,6 +104,7 @@ class UnboundVariant:
     sku: str
     item_codes: tuple[str, ...] = ()
     other_variant_ids: tuple[str, ...] = ()
+    accepted_unbound: "UnboundVariant | None" = None
 
 
 @dataclass(frozen=True)
@@ -128,36 +133,46 @@ def compute_bindings(
         by_normalized.setdefault(_normalize(code), []).append(code)
     sku_counts = Counter(v.sku for v in push_set if not _is_empty(v.sku))
 
-    bindings: list[Binding] = []
-    unbound: list[UnboundVariant] = []
-    for v in push_set:
-        bound_code = previous.get(v.variant_id)
-        if (
-            bound_code is not None
-            and bound_code != v.sku
-            and accepted.get(v.variant_id) != v.sku
-        ):
-            unbound.append(_unbound(UnboundKind.SKU_CHANGED, v, (bound_code,)))
-        elif _is_empty(v.sku):
-            unbound.append(_unbound(UnboundKind.EMPTY_SKU, v))
-        elif sku_counts[v.sku] > 1:
+    def unbound_reason(v: ShopifyVariant) -> UnboundVariant | None:
+        if _is_empty(v.sku):
+            return _unbound(UnboundKind.EMPTY_SKU, v)
+        if sku_counts[v.sku] > 1:
             others = tuple(
                 o.variant_id for o in push_set if o.sku == v.sku and o is not v
             )
-            unbound.append(
-                UnboundVariant(
-                    UnboundKind.DUPLICATE_SKU,
-                    v.variant_id,
-                    v.sku,
-                    other_variant_ids=others,
-                )
+            return UnboundVariant(
+                UnboundKind.DUPLICATE_SKU, v.variant_id, v.sku, other_variant_ids=others
             )
-        elif (match := by_code.get(v.sku)) is None:
+        if (match := by_code.get(v.sku)) is None:
             candidates = tuple(by_normalized.get(_normalize(v.sku), ()))
             kind = UnboundKind.NEAR_MATCH if candidates else UnboundKind.NO_ITEM
-            unbound.append(_unbound(kind, v, candidates))
-        elif (kind := _item_unusable(match)) is not None:
-            unbound.append(_unbound(kind, v, (match.item_code,)))
+            return _unbound(kind, v, candidates)
+        if (kind := _item_unusable(match)) is not None:
+            return _unbound(kind, v, (match.item_code,))
+        return None
+
+    bindings: list[Binding] = []
+    unbound: list[UnboundVariant] = []
+    for v in push_set:
+        reason = unbound_reason(v)
+        bound_code = previous.get(v.variant_id)
+        is_accepted = accepted.get(v.variant_id) == v.sku
+        if (
+            bound_code is not None
+            and bound_code != v.sku
+            and not (is_accepted and reason is None)
+        ):
+            unbound.append(
+                UnboundVariant(
+                    UnboundKind.SKU_CHANGED,
+                    v.variant_id,
+                    v.sku,
+                    (bound_code,),
+                    accepted_unbound=reason if is_accepted else None,
+                )
+            )
+        elif reason is not None:
+            unbound.append(reason)
         else:
             bindings.append(Binding(v.variant_id, v.inventory_item_id, v.sku))
     return BindingResult(tuple(bindings), tuple(unbound))
@@ -346,9 +361,9 @@ def save_bindings(
     """Make the stored bindings and held SKU changes those of `result`.
 
     An unchanged binding keeps its `bound_at`, and a held change its
-    `detected_at`. A change still held loses its acceptance: the variant's SKU
-    is no longer the accepted one. Rows of variants not bound, or not changed,
-    are removed.
+    `detected_at`. A change still held keeps its acceptance only while the
+    variant's SKU is the accepted one, which then does not bind yet. Rows of
+    variants not bound, or not changed, are removed.
     """
     stamp = utc_timestamp(now)
     wanted = {(b.variant_id, b.inventory_item_id, b.item_code) for b in result.bindings}
@@ -380,8 +395,9 @@ def _replace_changes(
     connection.executemany(
         "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
         " VALUES (?, ?, ?)"
-        " ON CONFLICT (variant_id) DO UPDATE SET accepted_sku = NULL",
-        [(u.variant_id, u.item_codes[0], stamp) for u in changes],
+        " ON CONFLICT (variant_id) DO UPDATE SET accepted_sku ="
+        " CASE WHEN accepted_sku = ? THEN accepted_sku END",
+        [(u.variant_id, u.item_codes[0], stamp, u.sku) for u in changes],
     )
 
 
