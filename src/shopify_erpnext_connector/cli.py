@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
-from typing import TypeVar
+from typing import ClassVar, TypeVar
 
 import httpx
 
@@ -467,18 +467,26 @@ def _render_accepted_sku_change(document: JsonObject) -> str:
 class _Read:
     """A read command: the API path, its parameters and the text rendering."""
 
+    mutation: ClassVar[bool] = False
     path: str
     render: Callable[[JsonObject], str]
     params: Callable[[Mapping[str, object]], dict[str, str]] = lambda _: {}
+
+    def send(self, target: Target, values: Mapping[str, object]) -> JsonObject:
+        return request(target, self.path, params=self.params(values))
 
 
 @dataclass(frozen=True)
 class _Write:
     """A mutation: the API path, its JSON body and the text rendering."""
 
+    mutation: ClassVar[bool] = True
     path: str
     render: Callable[[JsonObject], str]
     body: Callable[[Mapping[str, object]], JsonObject]
+
+    def send(self, target: Target, values: Mapping[str, object]) -> JsonObject:
+        return request(target, self.path, body=self.body(values))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -568,21 +576,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if values.get("json"):
             parser.error("serve has no --json output")
         return serve()
-    call = values["call"]
-    assert isinstance(call, _Read | _Write)
+    call: _Read | _Write = values["call"]
     try:
         target = resolve_target(
             env_option if isinstance(env_option, str) else None,
             os.environ,
-            mutation=isinstance(call, _Write),
+            mutation=call.mutation,
         )
     except CliError as error:
         return _fail(str(error))
     try:
-        if isinstance(call, _Write):
-            document = request(target, call.path, body=call.body(values))
-        else:
-            document = request(target, call.path, params=call.params(values))
+        document = call.send(target, values)
         output = (
             json.dumps(document, indent=2)
             if values.get("json")
