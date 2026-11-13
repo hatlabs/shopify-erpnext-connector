@@ -335,13 +335,20 @@ def _render_bindings(document: JsonObject) -> str:
         )
     changes = _objects(document, "sku_changes")
     lines.append(f"Held SKU changes: {len(changes) or 'none'}")
-    lines.extend(
+    lines.extend(_held_line(change) for change in changes)
+    return "\n".join(lines)
+
+
+def _held_line(change: JsonObject) -> str:
+    line = (
         f"  {change.get('variant_id')}  was bound to {change.get('bound_item_code')},"
         f" SKU now {change.get('sku') or 'unknown'},"
         f" held since {change.get('detected_at')}"
-        for change in changes
     )
-    return "\n".join(lines)
+    accepted = _optional(change, "accepted_sku", str)
+    if accepted is not None:
+        line += f", accepted {accepted} for the next full pass"
+    return line
 
 
 def _binding_line(document: JsonObject) -> str:
@@ -443,9 +450,10 @@ def _render_accepted_sku_change(document: JsonObject) -> str:
     return "\n".join(
         [
             _environment_line(document),
-            f"Accepted the new SKU of {_field(document, 'variant_id', str)},"
+            f"Accepted SKU {_field(document, 'accepted_sku', str)}"
+            f" for {_field(document, 'variant_id', str)},"
             f" which was bound to {_field(document, 'bound_item_code', str)}.",
-            "The next pass binds it by its new SKU.",
+            "The next full pass binds it by that SKU if the variant still has it.",
         ]
     )
 
@@ -512,7 +520,8 @@ def _parser() -> argparse.ArgumentParser:
     accept = bindings.add_subparsers(dest="action").add_parser(
         "accept-sku-change",
         parents=[common],
-        help="let a variant held after its SKU changed bind by its new SKU",
+        help="let a variant held after its SKU changed bind by the SKU"
+        " `bindings` shows",
     )
     accept.add_argument("variant", help="the variant's GID")
     accept.set_defaults(

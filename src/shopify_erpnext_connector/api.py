@@ -62,7 +62,11 @@ from shopify_erpnext_connector.problems import (
 )
 from shopify_erpnext_connector.push import recent_pushes, unpushed_since
 from shopify_erpnext_connector.store import dry_run, set_dry_run, utc_timestamp
-from shopify_erpnext_connector.worker import BINDING_PROBLEM_KINDS, SKU_DETAIL
+from shopify_erpnext_connector.worker import (
+    BINDING_PROBLEM_KINDS,
+    NO_SKU,
+    SKU_DETAIL,
+)
 
 ENVIRONMENT_HEADER = "X-Connector-Environment"
 JSON_CONTENT_TYPE = "application/json"
@@ -335,6 +339,7 @@ class ApiServer:
                         "variant_id": change.variant_id,
                         "bound_item_code": change.bound_item_code,
                         "sku": new_skus.get(change.variant_id),
+                        "accepted_sku": change.accepted_sku,
                         "detected_at": change.detected_at,
                     }
                     for change in load_sku_changes(request.connection)
@@ -415,13 +420,31 @@ class ApiServer:
             return self.error(
                 HTTPStatus.BAD_REQUEST, "the body needs 'variant' as a variant GID"
             )
-        change = load_sku_change(request.connection, variant_id)
+        connection = request.connection
+        change = load_sku_change(connection, variant_id)
         if change is None:
             return self.error(
                 HTTPStatus.NOT_FOUND, f"variant {variant_id} has no held SKU change"
             )
-        accept_sku_change(request.connection, variant_id)
-        detail = {"variant_id": variant_id, "bound_item_code": change.bound_item_code}
+        # The SKU `bindings` shows: the one the operator saw and accepts.
+        problem = get_problem(connection, ProblemKind.CHANGED_SKU, variant_id)
+        sku = (
+            None
+            if problem is None or problem.resolved_at is not None
+            else problem.details.get(SKU_DETAIL)
+        )
+        if sku is None or sku == NO_SKU:
+            return self.error(
+                HTTPStatus.CONFLICT,
+                f"variant {variant_id} has no new SKU recorded to accept;"
+                " retry after the next full pass",
+            )
+        accept_sku_change(connection, variant_id, sku)
+        detail = {
+            "variant_id": variant_id,
+            "bound_item_code": change.bound_item_code,
+            "accepted_sku": sku,
+        }
         self.audit_mutation(request, ACCEPT_SKU_CHANGE_ACTION, detail)
         self._worker.request_full_pass()
         return self.json(HTTPStatus.OK, detail)

@@ -42,6 +42,7 @@ from shopify_erpnext_connector.worker import (
     HELD_ACTION,
     MAX_RETRY_BACKOFF,
     SALE_SETTLE_HOLD,
+    SKU_DETAIL,
     Worker,
 )
 
@@ -1469,16 +1470,8 @@ OPERATOR_TOKEN = "test-operator-token"
 AUTH_HEADER = "Authorization"
 
 
-def test_an_accepted_sku_change_binds_the_variant_to_its_new_sku_next_pass(
-    world: World,
-) -> None:
-    world.bind(9, actual=4, available=0)
-    world.worker.run_pass(NOW)
-    world.shopify.set_sku(9, item_code(10))
-    world.erpnext.add_item(item_code(10))
-    world.erpnext.set_bin(item_code(10), actual=2)
-    world.worker.run_pass(NOW + FULL_PASS_INTERVAL)
-    assert world.open_of(ProblemKind.CHANGED_SKU) == [variant_id(9)]
+def accept_sku_change(world: World, n: int) -> httpx.Response:
+    """Accept variant `n`'s SKU change through the API, as the CLI does."""
     config = replace(
         world.config,
         store_path=world.path,
@@ -1490,9 +1483,9 @@ def test_an_accepted_sku_change_binds_the_variant_to_its_new_sku_next_pass(
     server = ApiServer(config, world.worker)
     server.start()
     try:
-        response = httpx.post(
+        return httpx.post(
             f"http://127.0.0.1:{server.port}/bindings/accept-sku-change",
-            json={"variant": variant_id(9)},
+            json={"variant": variant_id(n)},
             headers={
                 AUTH_HEADER: f"Bearer {OPERATOR_TOKEN}",
                 ENVIRONMENT_HEADER: world.config.environment,
@@ -1500,7 +1493,24 @@ def test_an_accepted_sku_change_binds_the_variant_to_its_new_sku_next_pass(
         )
     finally:
         server.close()
-    assert response.status_code == 200
+
+
+def hold_sku_change(world: World, n: int, new_sku: int) -> None:
+    """Bind variant `n`, then change its SKU to item `new_sku`'s code."""
+    world.bind(n, actual=4, available=0)
+    world.worker.run_pass(NOW)
+    world.shopify.set_sku(n, item_code(new_sku))
+    world.erpnext.add_item(item_code(new_sku))
+    world.erpnext.set_bin(item_code(new_sku), actual=2)
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL)
+    assert world.open_of(ProblemKind.CHANGED_SKU) == [variant_id(n)]
+
+
+def test_an_accepted_sku_change_binds_the_variant_to_its_new_sku_next_pass(
+    world: World,
+) -> None:
+    hold_sku_change(world, 9, 10)
+    assert accept_sku_change(world, 9).status_code == 200
 
     world.worker.run_pass(NOW + FULL_PASS_INTERVAL + SECOND)
 
@@ -1510,3 +1520,26 @@ def test_an_accepted_sku_change_binds_the_variant_to_its_new_sku_next_pass(
     assert world.shopify.available(9) == 2
     operators = world.store.execute("SELECT operator FROM audit_log").fetchall()
     assert operators == [("alice",)]
+
+
+def test_a_sku_changed_again_after_acceptance_stays_held(world: World) -> None:
+    hold_sku_change(world, 9, 10)
+    assert accept_sku_change(world, 9).status_code == 200
+    world.shopify.set_sku(9, item_code(11))
+    world.erpnext.add_item(item_code(11))
+    world.erpnext.set_bin(item_code(11), actual=7)
+    before = world.shopify.available(9)
+
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL + SECOND)
+
+    assert world.worker.last_pass_full
+    assert bound_item_code(world.store, variant_id(9)) is None
+    assert world.shopify.available(9) == before
+    problem = get_problem(world.store, ProblemKind.CHANGED_SKU, variant_id(9))
+    assert problem is not None
+    assert problem.resolved_at is None
+    assert problem.details[SKU_DETAIL] == item_code(11)
+    held = world.store.execute(
+        "SELECT bound_item_code, accepted_sku FROM sku_changes"
+    ).fetchall()
+    assert held == [(item_code(9), None)]

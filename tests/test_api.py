@@ -23,12 +23,14 @@ from shopify_erpnext_connector.api import (
     ApiServer,
     audit,
 )
+from shopify_erpnext_connector.bindings import load_accepted
 from shopify_erpnext_connector.config import ApiConfig, Environment, Secret
 from shopify_erpnext_connector.decisions import Decision, save_decisions
 from shopify_erpnext_connector.poller import mark_dirty
 from shopify_erpnext_connector.problems import Problem, ProblemKind, record_check
 from shopify_erpnext_connector.push import PushOutcome
 from shopify_erpnext_connector.store import open_store, set_dry_run, utc_timestamp
+from shopify_erpnext_connector.worker import NO_SKU
 
 NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
 ALICE_TOKEN = "test-alice-token"
@@ -655,6 +657,7 @@ def hold_sku_change(
         ProblemKind.CHANGED_SKU,
         [Problem(ProblemKind.CHANGED_SKU, variant_id, {"SKU": sku})],
         NOW,
+        checked={variant_id},
     )
 
 
@@ -694,6 +697,7 @@ def test_bindings_lists_unbound_ambiguous_and_held_variants(
             "variant_id": third,
             "bound_item_code": "TEST-ITEM-003",
             "sku": "TEST-SKU-003-NEW",
+            "accepted_sku": None,
             "detected_at": utc_timestamp(NOW),
         }
     ]
@@ -1212,7 +1216,7 @@ def accept_sku_change(
     )
 
 
-def test_accepting_a_sku_change_removes_the_hold_and_asks_for_a_full_pass(
+def test_accepting_a_sku_change_records_the_sku_and_asks_for_a_full_pass(
     client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
 ) -> None:
     hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
@@ -1220,22 +1224,52 @@ def test_accepting_a_sku_change_removes_the_hold_and_asks_for_a_full_pass(
 
     response = accept_sku_change(client, VARIANT, BOB_TOKEN)
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "environment": "staging",
+    accepted = {
         "variant_id": VARIANT,
         "bound_item_code": "TEST-ITEM-001",
+        "accepted_sku": "TEST-SKU-001-NEW",
     }
+    assert response.status_code == 200
+    assert response.json() == {"environment": "staging"} | accepted
     bindings = client.get("/bindings", headers=operator()).json()
-    assert [c["variant_id"] for c in bindings["sku_changes"]] == [OTHER_VARIANT]
-    assert audit_rows(store) == [
-        (
-            "bob",
-            "accept-sku-change",
-            {"variant_id": VARIANT, "bound_item_code": "TEST-ITEM-001"},
-        )
+    assert [(c["variant_id"], c["accepted_sku"]) for c in bindings["sku_changes"]] == [
+        (VARIANT, "TEST-SKU-001-NEW"),
+        (OTHER_VARIANT, None),
     ]
+    assert audit_rows(store) == [("bob", "accept-sku-change", accepted)]
     assert worker.full_passes_requested == 1
+
+
+def test_accepting_a_sku_change_without_a_recorded_sku_is_a_conflict(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    store.execute(
+        "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
+        " VALUES (?, 'TEST-ITEM-001', ?)",
+        (VARIANT, utc_timestamp(NOW)),
+    )
+
+    response = accept_sku_change(client, VARIANT)
+
+    assert response.status_code == 409
+    assert response.json()["environment"] == "staging"
+    assert "SKU" in response.json()["error"]
+    assert audit_rows(store) == []
+    assert worker.full_passes_requested == 0
+    assert load_accepted(store) == {}
+
+
+def test_accepting_a_cleared_sku_is_a_conflict(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", NO_SKU)
+
+    response = accept_sku_change(client, VARIANT)
+
+    assert response.status_code == 409
+    assert audit_rows(store) == []
+    assert worker.full_passes_requested == 0
+    assert load_accepted(store) == {}
 
 
 def test_accepting_a_sku_change_on_a_variant_without_one_changes_nothing(

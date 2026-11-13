@@ -112,6 +112,8 @@ _POLICY_TEXTS = {
 
 # The binding problems' detail naming the variant's current SKU.
 SKU_DETAIL = "SKU"
+# The SKU detail of a variant with no SKU.
+NO_SKU = "(none)"
 
 _BINDING_PROBLEM_KINDS = {
     UnboundKind.EMPTY_SKU: ProblemKind.UNBOUND_SKU,
@@ -560,7 +562,7 @@ def _oversell(computed: _Computed, match: OrderMatch) -> Problem:
 
 def _binding_details(variant: UnboundVariant) -> dict[str, str]:
     details = {
-        SKU_DETAIL: variant.sku or "(none)",
+        SKU_DETAIL: variant.sku or NO_SKU,
         "Reason": _BINDING_REASONS[variant.kind],
     }
     if variant.kind is UnboundKind.NEAR_MATCH:

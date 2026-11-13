@@ -947,11 +947,17 @@ def audit_rows(store: sqlite3.Connection) -> list[tuple[str, str]]:
     return store.execute("SELECT operator, action FROM audit_log").fetchall()
 
 
-def hold(store: sqlite3.Connection, variant_id: str, item_code: str) -> None:
+def hold(store: sqlite3.Connection, variant_id: str, item_code: str, sku: str) -> None:
     store.execute(
         "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
         " VALUES (?, ?, ?)",
         (variant_id, item_code, utc_timestamp(NOW)),
+    )
+    record_check(
+        store,
+        ProblemKind.CHANGED_SKU,
+        [Problem(ProblemKind.CHANGED_SKU, variant_id, {"SKU": sku})],
+        NOW,
     )
 
 
@@ -998,28 +1004,31 @@ def test_dry_run_takes_on_or_off(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 @pytest.mark.usefixtures("connected")
-def test_accept_sku_change_removes_the_hold(
+def test_accept_sku_change_names_the_accepted_sku(
     store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    hold(store, VARIANT, "TEST-ITEM-001")
+    hold(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
 
     code, out, err = run(capsys, "bindings", "accept-sku-change", VARIANT)
 
     assert code == 0, err
     assert out.splitlines() == [
         "Environment: staging",
-        f"Accepted the new SKU of {VARIANT}, which was bound to TEST-ITEM-001.",
-        "The next pass binds it by its new SKU.",
+        f"Accepted SKU TEST-SKU-001-NEW for {VARIANT},"
+        " which was bound to TEST-ITEM-001.",
+        "The next full pass binds it by that SKU if the variant still has it.",
     ]
-    assert store.execute("SELECT count(*) FROM sku_changes").fetchone()[0] == 0
     assert audit_rows(store) == [("alice", "accept-sku-change")]
+    code, out, err = run(capsys, "bindings")
+    assert code == 0, err
+    assert "accepted TEST-SKU-001-NEW" in out
 
 
 @pytest.mark.usefixtures("connected")
 def test_accept_sku_change_as_json(
     store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    hold(store, VARIANT, "TEST-ITEM-001")
+    hold(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
 
     code, out, _ = run(capsys, "bindings", "accept-sku-change", VARIANT, "--json")
 

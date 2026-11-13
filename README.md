@@ -57,7 +57,7 @@ These commands change the connector:
 | Command | Does |
 |---|---|
 | `dry-run on` or `dry-run off` | turns dry-run on or off; turning it off makes the next pass a full one, which pushes every bound variant. Setting the state it already has changes nothing and says so |
-| `bindings accept-sku-change <variant GID>` | accepts the new SKU of a variant held after its SKU changed: the next pass binds it by that SKU. A variant without a held change is reported as not found |
+| `bindings accept-sku-change <variant GID>` | accepts the new SKU that `bindings` shows for a variant held after its SKU changed: the next full pass binds the variant by that SKU if it still has it, and otherwise keeps it held and reports its newer SKU. A variant without a held change is reported as not found, and one with no new SKU recorded as a conflict |
 
 A command that changes production runs only with `--env production` on the command line; `CONNECTOR_ENV=production` alone is refused before the token is read. If a pass is running for longer than the connector waits, the command fails with a 503; run it again.
 

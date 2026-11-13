@@ -123,6 +123,11 @@ MIGRATIONS: tuple[str, ...] = (
     );
     INSERT INTO settings (id, dry_run) VALUES (1, 1);
     """,
+    """
+    -- The SKU an operator accepted for a held change: the next full pass binds
+    -- the variant only if its SKU is still this one.
+    ALTER TABLE sku_changes ADD COLUMN accepted_sku TEXT;
+    """,
 )
 
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"

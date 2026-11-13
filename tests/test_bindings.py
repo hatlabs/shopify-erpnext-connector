@@ -16,9 +16,11 @@ from shopify_erpnext_connector.bindings import (
     ShopifyVariant,
     UnboundKind,
     UnboundVariant,
+    accept_sku_change,
     compute_bindings,
     fetch_items,
     fetch_variants,
+    load_accepted,
     load_bindings,
     load_previous,
     refresh_bindings,
@@ -549,7 +551,9 @@ def run_pass(
     items: list[ErpItem],
     now: datetime = NOW,
 ) -> BindingResult:
-    result = compute_bindings(variants, items, load_previous(store))
+    result = compute_bindings(
+        variants, items, load_previous(store), accepted=load_accepted(store)
+    )
     save_bindings(store, result, now)
     return result
 
@@ -740,3 +744,73 @@ def test_refresh_bindings_fetches_computes_and_saves(
     assert result.bindings == (binding_of(variant(1, "TEST-001"), "TEST-001"),)
     assert [u.kind for u in result.unbound] == [UnboundKind.NO_ITEM]
     assert [row[2] for row in binding_rows(store)] == ["TEST-001"]
+
+
+def test_a_changed_sku_equal_to_the_accepted_one_binds() -> None:
+    v = variant(1, "TEST-NEW")
+
+    result = compute_bindings(
+        [v],
+        [item("TEST-OLD"), item("TEST-NEW")],
+        {v.variant_id: "TEST-OLD"},
+        accepted={v.variant_id: "TEST-NEW"},
+    )
+
+    assert result.bindings == (binding_of(v, "TEST-NEW"),)
+    assert result.unbound == ()
+
+
+def test_a_changed_sku_other_than_the_accepted_one_stays_a_sku_change() -> None:
+    v = variant(1, "TEST-NEWER")
+
+    result = compute_bindings(
+        [v],
+        [item("TEST-OLD"), item("TEST-NEW"), item("TEST-NEWER")],
+        {v.variant_id: "TEST-OLD"},
+        accepted={v.variant_id: "TEST-NEW"},
+    )
+
+    assert result.bindings == ()
+    assert only_unbound(result) == UnboundVariant(
+        UnboundKind.SKU_CHANGED, v.variant_id, "TEST-NEWER", ("TEST-OLD",)
+    )
+
+
+def held_rows(store: sqlite3.Connection) -> list[tuple[str, str, str | None]]:
+    return store.execute(
+        "SELECT variant_id, bound_item_code, accepted_sku FROM sku_changes"
+    ).fetchall()
+
+
+def test_an_accepted_sku_change_binds_and_drops_the_hold(
+    store: sqlite3.Connection,
+) -> None:
+    items = [item("TEST-OLD"), item("TEST-NEW")]
+    run_pass(store, [variant(1, "TEST-OLD")], items)
+    run_pass(store, [variant(1, "TEST-NEW")], items)
+
+    accept_sku_change(store, "gid://shopify/ProductVariant/1", "TEST-NEW")
+    result = run_pass(store, [variant(1, "TEST-NEW")], items, LATER)
+
+    assert result.bindings == (binding_of(variant(1, "TEST-NEW"), "TEST-NEW"),)
+    assert held_rows(store) == []
+    assert load_previous(store) == {"gid://shopify/ProductVariant/1": "TEST-NEW"}
+
+
+def test_a_sku_changed_again_after_acceptance_keeps_the_hold_unaccepted(
+    store: sqlite3.Connection,
+) -> None:
+    items = [item("TEST-OLD"), item("TEST-NEW"), item("TEST-NEWER")]
+    run_pass(store, [variant(1, "TEST-OLD")], items)
+    run_pass(store, [variant(1, "TEST-NEW")], items)
+    accept_sku_change(store, "gid://shopify/ProductVariant/1", "TEST-NEW")
+    assert load_accepted(store) == {"gid://shopify/ProductVariant/1": "TEST-NEW"}
+
+    result = run_pass(store, [variant(1, "TEST-NEWER")], items, LATER)
+
+    assert result.bindings == ()
+    assert only_unbound(result).kind is UnboundKind.SKU_CHANGED
+    assert only_unbound(result).sku == "TEST-NEWER"
+    assert binding_rows(store) == []
+    assert held_rows(store) == [("gid://shopify/ProductVariant/1", "TEST-OLD", None)]
+    assert load_accepted(store) == {}
