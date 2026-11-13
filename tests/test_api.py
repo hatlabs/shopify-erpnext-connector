@@ -4,6 +4,7 @@ import socket
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from helpers import FakeWorker, make_config
+from helpers import FakeWorker, PassRequest, make_config
 
 from shopify_erpnext_connector import api
 from shopify_erpnext_connector.api import (
@@ -26,7 +27,7 @@ from shopify_erpnext_connector.api import (
 from shopify_erpnext_connector.bindings import load_accepted
 from shopify_erpnext_connector.config import ApiConfig, Environment, Secret
 from shopify_erpnext_connector.decisions import Decision, save_decisions
-from shopify_erpnext_connector.poller import mark_dirty
+from shopify_erpnext_connector.poller import clear_dirty, dirty_items, mark_dirty
 from shopify_erpnext_connector.problems import Problem, ProblemKind, record_check
 from shopify_erpnext_connector.push import PushOutcome
 from shopify_erpnext_connector.retry import READ_TIMEOUT_SECONDS
@@ -36,12 +37,13 @@ from shopify_erpnext_connector.store import (
     set_dry_run,
     utc_timestamp,
 )
-from shopify_erpnext_connector.worker import NO_SKU
+from shopify_erpnext_connector.worker import NO_SKU, PassResult
 
 NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
 ALICE_TOKEN = "test-alice-token"
 REQUEST_TIMEOUT_SECONDS = 0.5
 WRITER_LOCK_TIMEOUT_SECONDS = 0.5
+PASS_WAIT_TIMEOUT_SECONDS = 0.5
 BOB_TOKEN = "test-bob-token"
 METRICS_TOKEN = "test-metrics-token"
 # Kept apart from its value so the fixture check's header pattern stays meaningful.
@@ -101,6 +103,7 @@ def server(store_path: Path, worker: FakeWorker, clock: Clock) -> Iterator[ApiSe
         clock=clock,
         request_timeout=REQUEST_TIMEOUT_SECONDS,
         writer_lock_timeout=WRITER_LOCK_TIMEOUT_SECONDS,
+        pass_wait_timeout=PASS_WAIT_TIMEOUT_SECONDS,
     )
     server.start()
     yield server
@@ -1168,6 +1171,8 @@ def test_a_bad_content_length_is_a_bad_request(
 MUTATIONS = {
     "/dry-run": {"on": False},
     "/bindings/accept-sku-change": {"variant": VARIANT, "sku": "TEST-SKU-001-NEW"},
+    "/push": {"all": True},
+    "/rerun": {"key": f"unbound_sku:{VARIANT}"},
 }
 
 
@@ -1291,7 +1296,7 @@ def test_accepting_a_sku_change_records_the_sku_and_asks_for_a_full_pass(
         (OTHER_VARIANT, None),
     ]
     assert audit_rows(store) == [("bob", "accept-sku-change", accepted)]
-    assert worker.full_passes_requested == 1
+    assert worker.requests == [PassRequest(full=True, items=())]
 
 
 def test_accepting_a_sku_other_than_the_recorded_one_is_a_conflict(
@@ -1309,7 +1314,7 @@ def test_accepting_a_sku_other_than_the_recorded_one_is_a_conflict(
     assert "bindings" in error
     assert audit_rows(store) == []
     assert load_accepted(store) == {}
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []
 
 
 def test_accepting_a_sku_change_while_a_pass_holds_the_lock_is_refused(
@@ -1323,7 +1328,7 @@ def test_accepting_a_sku_change_while_a_pass_holds_the_lock_is_refused(
     assert response.status_code == 503
     assert audit_rows(store) == []
     assert load_accepted(store) == {}
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []
 
 
 def test_a_mutation_outwaits_one_upstream_attempt() -> None:
@@ -1375,7 +1380,7 @@ def test_accepting_a_sku_change_with_no_sku_to_accept_is_a_conflict(
     assert response.json()["environment"] == "staging"
     assert message in response.json()["error"]
     assert audit_rows(store) == []
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []
     assert load_accepted(store) == {}
 
 
@@ -1390,7 +1395,7 @@ def test_accepting_a_sku_change_on_a_variant_without_one_changes_nothing(
     assert response.json()["environment"] == "staging"
     assert VARIANT in response.json()["error"]
     assert audit_rows(store) == []
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []
     assert store.execute("SELECT count(*) FROM sku_changes").fetchone()[0] == 1
 
 
@@ -1420,4 +1425,342 @@ def test_accepting_a_sku_change_needs_a_variant_and_a_sku(
     assert f"'{field}'" in response.json()["error"]
     assert audit_rows(store) == []
     assert load_accepted(store) == {}
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []
+
+
+# Push and rerun
+
+PassEffect = Callable[[sqlite3.Connection], None]
+
+
+@pytest.fixture
+def during_pass(store_path: Path, worker: FakeWorker) -> Callable[[PassEffect], None]:
+    """Set what the worker's pass does to the store while the API waits."""
+
+    def set_effect(effect: PassEffect) -> None:
+        def run() -> None:
+            # Runs in the API's thread, so on a connection of its own.
+            with closing(open_store(store_path)) as connection:
+                effect(connection)
+
+        worker.during_pass = run
+
+    return set_effect
+
+
+def push(client: httpx.Client, body: dict[str, object]) -> httpx.Response:
+    return client.post("/push", json=body, headers=operator())
+
+
+def test_pushing_a_variant_marks_its_item_and_reports_the_pass(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    during_pass: Callable[[PassEffect], None],
+) -> None:
+    bind(store, VARIANT, "TEST-ITEM-001")
+    bind(store, OTHER_VARIANT, "TEST-ITEM-002")
+    marked: list[list[str]] = []
+
+    def pass_pushes(connection: sqlite3.Connection) -> None:
+        marked.append(list(dirty_items(connection)))
+        decide(connection, VARIANT, "TEST-ITEM-001")
+        record_push(connection, VARIANT, 3, NOW + timedelta(seconds=1))
+        clear_dirty(connection, ["TEST-ITEM-001"])
+
+    during_pass(pass_pushes)
+
+    response = push(client, {"variant": VARIANT})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["variant_id"] == VARIANT
+    assert body["item_code"] == "TEST-ITEM-001"
+    assert body["pass"] == "completed"
+    assert body["dry_run"] is True
+    assert body["decision"]["action"] == "pushed"
+    assert body["decision"]["decided_at"] == utc_timestamp(NOW)
+    assert body["push"]["available"] == 3
+    assert body["push"]["outcome"] == "pushed"
+    assert marked == [["TEST-ITEM-001"]]
+    assert worker.requests == [PassRequest(full=False, items=("TEST-ITEM-001",))]
+    assert worker.waits == [(1, PASS_WAIT_TIMEOUT_SECONDS)]
+    assert audit_rows(store) == [
+        ("alice", "push", {"variant_id": VARIANT, "item_code": "TEST-ITEM-001"})
+    ]
+
+
+def test_pushing_a_variant_never_computed_reports_no_decision(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    bind(store, VARIANT, "TEST-ITEM-001")
+
+    body = push(client, {"variant": VARIANT}).json()
+
+    assert body["decision"] is None
+    assert body["push"] is None
+
+
+def test_pushing_all_marks_every_bound_item_and_counts_those_left(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    during_pass: Callable[[PassEffect], None],
+) -> None:
+    bind(store, VARIANT, "TEST-ITEM-001")
+    bind(store, OTHER_VARIANT, "TEST-ITEM-002")
+    during_pass(lambda connection: clear_dirty(connection, ["TEST-ITEM-001"]))
+
+    response = push(client, {"all": True})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "environment": "staging",
+        "all": True,
+        "item_count": 2,
+        "still_dirty": 1,
+        "dry_run": True,
+        "pass": "completed",
+    }
+    assert worker.requests == [
+        PassRequest(full=False, items=("TEST-ITEM-001", "TEST-ITEM-002"))
+    ]
+    assert audit_rows(store) == [("alice", "push", {"all": True, "item_count": 2})]
+
+
+def test_a_push_whose_pass_does_not_end_in_time_is_still_accepted(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    bind(store, VARIANT, "TEST-ITEM-001")
+    worker.pass_result = PassResult.NOT_FINISHED
+
+    response = push(client, {"variant": VARIANT})
+
+    assert response.status_code == 200
+    assert response.json()["pass"] == "not finished"
+    assert len(audit_rows(store)) == 1
+    assert dirty_items(store).keys() == {"TEST-ITEM-001"}
+
+
+def test_a_push_whose_pass_ended_early_says_so(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    bind(store, VARIANT, "TEST-ITEM-001")
+    worker.pass_result = PassResult.ENDED_EARLY
+
+    response = push(client, {"all": True})
+
+    assert response.status_code == 200
+    assert response.json()["pass"] == "ended early"
+
+
+def test_pushing_an_unbound_variant_is_a_conflict_and_changes_nothing(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    open_unbound(store)
+
+    response = push(client, {"variant": VARIANT})
+
+    assert response.status_code == 409
+    assert VARIANT in response.json()["error"]
+    assert "record" in response.json()["error"]
+    assert audit_rows(store) == []
+    assert worker.requests == []
+    assert worker.waits == []
+
+
+def test_pushing_a_held_variant_is_a_conflict(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+
+    assert push(client, {"variant": VARIANT}).status_code == 409
+
+
+def test_pushing_an_unknown_variant_is_not_found(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    bind(store, OTHER_VARIANT, "TEST-ITEM-002")
+
+    response = push(client, {"variant": VARIANT})
+
+    assert response.status_code == 404
+    assert VARIANT in response.json()["error"]
+    assert audit_rows(store) == []
+    assert dirty_items(store) == {}
+    assert worker.requests == []
+
+
+def test_pushing_all_with_nothing_bound_is_a_conflict(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    response = push(client, {"all": True})
+
+    assert response.status_code == 409
+    assert audit_rows(store) == []
+    assert worker.requests == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"variant": ""},
+        {"variant": 1001},
+        {"all": False},
+        {"all": "yes"},
+        {"variant": VARIANT, "all": True},
+    ],
+)
+def test_push_needs_a_variant_or_all(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    body: dict[str, object],
+) -> None:
+    bind(store, VARIANT, "TEST-ITEM-001")
+
+    response = push(client, body)
+
+    assert response.status_code == 400
+    assert "variant" in response.json()["error"]
+    assert "all" in response.json()["error"]
+    assert worker.requests == []
+
+
+UNBOUND_KEY = f"unbound_sku:{VARIANT}"
+
+
+def open_unbound(connection: sqlite3.Connection) -> None:
+    record_check(
+        connection,
+        ProblemKind.UNBOUND_SKU,
+        [Problem(ProblemKind.UNBOUND_SKU, VARIANT, {"SKU": "TEST-SKU-001"})],
+        NOW,
+    )
+
+
+def rerun(client: httpx.Client, key: object) -> httpx.Response:
+    return client.post("/rerun", json={"key": key}, headers=operator(BOB_TOKEN))
+
+
+def test_rerun_asks_for_a_full_pass_and_reports_the_problem_cleared(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    during_pass: Callable[[PassEffect], None],
+) -> None:
+    open_unbound(store)
+    later = NOW + timedelta(minutes=1)
+    during_pass(
+        lambda connection: record_check(connection, ProblemKind.UNBOUND_SKU, [], later)
+    )
+
+    response = rerun(client, UNBOUND_KEY)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pass"] == "completed"
+    assert body["dry_run"] is True
+    assert body["key"] == body["problem"]["key"] == UNBOUND_KEY
+    assert body["problem"]["resolved_at"] == utc_timestamp(later)
+    assert worker.requests == [PassRequest(full=True, items=())]
+    assert worker.waits == [(1, PASS_WAIT_TIMEOUT_SECONDS)]
+    assert audit_rows(store) == [("bob", "rerun", {"key": UNBOUND_KEY})]
+
+
+def test_rerun_reports_a_problem_still_open(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    open_unbound(store)
+
+    body = rerun(client, UNBOUND_KEY).json()
+
+    assert body["pass"] == "completed"
+    assert body["problem"]["resolved_at"] is None
+
+
+def open_stale_push(connection: sqlite3.Connection) -> str:
+    location = make_config().location_id
+    record_check(
+        connection,
+        ProblemKind.STALE_PUSH,
+        [Problem(ProblemKind.STALE_PUSH, location, {})],
+        NOW,
+    )
+    return f"{ProblemKind.STALE_PUSH}:{location}"
+
+
+def test_rerun_of_a_stale_push_in_dry_run_is_a_conflict_and_changes_nothing(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    key = open_stale_push(store)
+
+    response = rerun(client, key)
+
+    assert response.status_code == 409
+    assert "dry run" in response.json()["error"]
+    assert audit_rows(store) == []
+    assert worker.requests == []
+    assert worker.waits == []
+
+
+def test_rerun_of_a_stale_push_with_dry_run_off_asks_for_a_pass(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    set_dry_run(store, False)
+    key = open_stale_push(store)
+
+    body = rerun(client, key).json()
+
+    assert body["pass"] == "completed"
+    assert body["dry_run"] is False
+    assert worker.requests == [PassRequest(full=True, items=())]
+
+
+def test_a_rerun_whose_pass_does_not_end_in_time_is_still_accepted(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    open_unbound(store)
+    worker.pass_result = PassResult.NOT_FINISHED
+
+    response = rerun(client, UNBOUND_KEY)
+
+    assert response.status_code == 200
+    assert response.json()["pass"] == "not finished"
+    assert len(audit_rows(store)) == 1
+
+
+def test_a_rerun_whose_pass_ended_early_says_so(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    open_unbound(store)
+    worker.pass_result = PassResult.ENDED_EARLY
+
+    response = rerun(client, UNBOUND_KEY)
+
+    assert response.status_code == 200
+    assert response.json()["pass"] == "ended early"
+
+
+@pytest.mark.parametrize("key", [UNBOUND_KEY, "no-such-kind:x", "unbound_sku"])
+def test_rerun_of_an_unknown_problem_is_not_found(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker, key: str
+) -> None:
+    response = rerun(client, key)
+
+    assert response.status_code == 404
+    assert key in response.json()["error"]
+    assert audit_rows(store) == []
+    assert worker.requests == []
+
+
+@pytest.mark.parametrize("key", [None, "", 7])
+def test_rerun_needs_a_key(
+    client: httpx.Client, worker: FakeWorker, key: object
+) -> None:
+    response = rerun(client, key)
+
+    assert response.status_code == 400
+    assert "key" in response.json()["error"]
+    assert worker.requests == []

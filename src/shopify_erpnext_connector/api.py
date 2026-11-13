@@ -19,6 +19,11 @@ what a pass works on first takes the worker's writer lock, waiting at most
 `writer_lock_timeout` for a running pass. Dry-run does not: a pass reads it
 once at its start, so a change takes effect from the next pass and can be
 made while ERPNext or Shopify is slow.
+`push` and `rerun` then release the lock and wait at most `pass_wait_timeout`
+for the pass they asked for, and name how it went in `pass`: "completed",
+"ended early" (it did not do the work asked; the log says why) or "not
+finished". A pass not finished in time still answers 200: the request stands
+and the worker runs it.
 
 Request logs go through `logging` and never include headers, so a token is
 never logged.
@@ -30,7 +35,7 @@ import logging
 import socket
 import sqlite3
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -39,21 +44,24 @@ from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import BaseServer
-from typing import Protocol
+from typing import Protocol, TypeVar
 from urllib.parse import parse_qsl, urlsplit
 
 from shopify_erpnext_connector.bindings import (
     accept_sku_change,
     bound_item_code,
     is_empty_sku,
+    load_bindings,
     load_sku_change,
     load_sku_changes,
 )
 from shopify_erpnext_connector.config import Config
 from shopify_erpnext_connector.decisions import (
+    DatedDecision,
     comparison_report,
     load_dated_decision,
 )
+from shopify_erpnext_connector.poller import dirty_items, insert_dirty
 from shopify_erpnext_connector.problems import (
     ProblemKind,
     StoredProblem,
@@ -71,6 +79,7 @@ from shopify_erpnext_connector.worker import (
     BINDING_PROBLEM_KINDS,
     NO_SKU,
     SKU_DETAIL,
+    PassResult,
 )
 
 ENVIRONMENT_HEADER = "X-Connector-Environment"
@@ -94,12 +103,17 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 # pass, after which the mutation answers 503 and the operator retries.
 WRITER_LOCK_MARGIN_SECONDS = 30.0
 WRITER_LOCK_TIMEOUT_SECONDS = READ_TIMEOUT_SECONDS + WRITER_LOCK_MARGIN_SECONDS
+# How long `push` and `rerun` wait for the pass they asked for to end. A full
+# pass reads every Item and variant.
+PASS_WAIT_TIMEOUT_SECONDS = 120.0
 # Request bodies hold a few identifiers; anything larger is refused unread.
 MAX_BODY_BYTES = 64 * 1024
 
 # Audit log action names; stable, so the log can be searched by them.
 DRY_RUN_ACTION = "dry-run"
 ACCEPT_SKU_CHANGE_ACTION = "accept-sku-change"
+PUSH_ACTION = "push"
+RERUN_ACTION = "rerun"
 
 _BEARER_SCHEME = "bearer"
 
@@ -123,7 +137,11 @@ class WorkerState(Protocol):
     @property
     def writer_lock(self) -> threading.Lock: ...
 
-    def request_full_pass(self) -> None: ...
+    def request_pass(
+        self, *, full: bool = False, items: Collection[str] = ()
+    ) -> int: ...
+
+    def wait_for_pass(self, ticket: int, timeout: float) -> PassResult: ...
 
 
 def audit(
@@ -170,11 +188,26 @@ class _Response:
 
 
 @dataclass(frozen=True)
+class _Waiting:
+    """A mutation that waits for the pass it asked for, then answers.
+
+    `answer` is called with how the pass went, in a read transaction begun
+    after the wait.
+    """
+
+    ticket: int
+    answer: Callable[[PassResult], _Response]
+
+
+@dataclass(frozen=True)
 class _Request:
     connection: sqlite3.Connection
     operator: str | None
     query: Mapping[str, str]
     body: Mapping[str, object] = field(default_factory=dict)
+
+
+_Result = TypeVar("_Result", bound=_Response | _Waiting)
 
 
 @dataclass(frozen=True)
@@ -184,6 +217,15 @@ class _Route:
     handle: Callable[["ApiServer", _Request], _Response]
     # Whether a mutation waits for the worker's writer lock.
     writer_lock: bool = True
+
+
+@dataclass(frozen=True)
+class _WaitingRoute:
+    """A mutation that asks for a pass and waits for it; it takes the writer lock."""
+
+    method: str
+    access: _Access
+    handle: Callable[["ApiServer", _Request], _Response | _Waiting]
 
 
 class ApiServer:
@@ -197,9 +239,11 @@ class ApiServer:
         clock: Callable[[], datetime] = _utc_now,
         request_timeout: float = REQUEST_TIMEOUT_SECONDS,
         writer_lock_timeout: float = WRITER_LOCK_TIMEOUT_SECONDS,
+        pass_wait_timeout: float = PASS_WAIT_TIMEOUT_SECONDS,
     ) -> None:
         self.request_timeout = request_timeout
         self.writer_lock_timeout = writer_lock_timeout
+        self.pass_wait_timeout = pass_wait_timeout
         self._config = config
         self._worker = worker
         self._clock = clock
@@ -265,7 +309,28 @@ class ApiServer:
     def mutate(self, route: _Route, request: _Request) -> _Response:
         """Run a mutation in one transaction, under the writer lock if it takes it."""
         if not route.writer_lock:
-            return self._transact(route, request)
+            return self._transact(route.handle, request)
+        return self._locked(route.handle, request)
+
+    def mutate_and_wait(self, route: _WaitingRoute, request: _Request) -> _Response:
+        """Run a mutation as `mutate` does, then wait for the pass it asked for.
+
+        The wait comes after the lock is released, since the pass needs it.
+        """
+        result = self._locked(route.handle, request)
+        if isinstance(result, _Response):
+            return result
+        outcome = self._worker.wait_for_pass(result.ticket, self.pass_wait_timeout)
+        connection = request.connection
+        connection.execute("BEGIN")
+        try:
+            return result.answer(outcome)
+        finally:
+            connection.rollback()
+
+    def _locked(
+        self, handle: Callable[["ApiServer", _Request], _Result], request: _Request
+    ) -> _Result | _Response:
         lock = self._worker.writer_lock
         if not lock.acquire(timeout=self.writer_lock_timeout):
             return self.error(
@@ -273,24 +338,28 @@ class ApiServer:
                 "a pass is running; retry the command in a moment",
             )
         try:
-            return self._transact(route, request)
+            return self._transact(handle, request)
         finally:
             lock.release()
 
-    def _transact(self, route: _Route, request: _Request) -> _Response:
+    def _transact(
+        self, handle: Callable[["ApiServer", _Request], _Result], request: _Request
+    ) -> _Result:
         connection = request.connection
         # IMMEDIATE: what the handler reads cannot change before it writes.
         connection.execute("BEGIN IMMEDIATE")
         try:
-            response = route.handle(self, request)
+            result = handle(self, request)
         except BaseException:
             # SQLite may have rolled back on its own, as after a disk-full error.
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
-        refused = response.status >= HTTPStatus.BAD_REQUEST
+        refused = (
+            isinstance(result, _Response) and result.status >= HTTPStatus.BAD_REQUEST
+        )
         connection.execute("ROLLBACK" if refused else "COMMIT")
-        return response
+        return result
 
     def connect(self) -> sqlite3.Connection:
         # mode=rw: a missing store is an error, not a new empty database.
@@ -373,15 +442,7 @@ class ApiServer:
             )
         connection = request.connection
         item_code = bound_item_code(connection, variant_id)
-        binding_problem = next(
-            (
-                problem
-                for kind in BINDING_PROBLEM_KINDS
-                if (problem := get_problem(connection, kind, variant_id)) is not None
-                and problem.resolved_at is None
-            ),
-            None,
-        )
+        binding_problem = _binding_problem(connection, variant_id)
         decision = load_dated_decision(connection, variant_id)
         history = recent_pushes(connection, variant_id, RECORD_PUSH_HISTORY)
         sku_change = load_sku_change(connection, variant_id)
@@ -398,11 +459,7 @@ class ApiServer:
                 "binding_problem": (
                     None if binding_problem is None else _problem_json(binding_problem)
                 ),
-                "decision": (
-                    None
-                    if decision is None
-                    else asdict(decision.decision) | {"decided_at": decision.decided_at}
-                ),
+                "decision": _decision_json(decision),
                 "sku_change": (
                     None
                     if sku_change is None
@@ -481,8 +538,111 @@ class ApiServer:
             "accepted_sku": sku,
         }
         self.audit_mutation(request, ACCEPT_SKU_CHANGE_ACTION, detail)
-        self._worker.request_full_pass()
+        self._worker.request_pass(full=True)
         return self.json(HTTPStatus.OK, detail)
+
+    def push(self, request: _Request) -> _Response | _Waiting:
+        body = request.body
+        variant_id = body.get("variant")
+        if "all" in body:
+            valid = body["all"] is True and "variant" not in body
+        else:
+            valid = isinstance(variant_id, str) and variant_id != ""
+        if not valid:
+            return self.error(
+                HTTPStatus.BAD_REQUEST,
+                "the body needs either 'variant' as a variant GID or 'all' as true",
+            )
+        connection = request.connection
+        if isinstance(variant_id, str):
+            item_code = bound_item_code(connection, variant_id)
+            if item_code is None:
+                return self._not_bound(connection, variant_id)
+            item_codes = [item_code]
+            detail: dict[str, object] = {
+                "variant_id": variant_id,
+                "item_code": item_code,
+            }
+        else:
+            item_codes = sorted({b.item_code for b in load_bindings(connection)})
+            if not item_codes:
+                return self.error(
+                    HTTPStatus.CONFLICT, "no variant is bound; there is nothing to push"
+                )
+            detail = {"all": True, "item_count": len(item_codes)}
+        insert_dirty(connection, item_codes, self._clock())
+        self.audit_mutation(request, PUSH_ACTION, detail)
+        ticket = self._worker.request_pass(items=item_codes)
+
+        def answer(result: PassResult) -> _Response:
+            outcome: dict[str, object] = {
+                "dry_run": dry_run(connection),
+                "pass": result,
+            }
+            if not isinstance(variant_id, str):
+                dirty = dirty_items(connection)
+                still_dirty = sum(code in dirty for code in item_codes)
+                return self.json(
+                    HTTPStatus.OK, detail | {"still_dirty": still_dirty} | outcome
+                )
+            newest = recent_pushes(connection, variant_id, 1)
+            return self.json(
+                HTTPStatus.OK,
+                detail
+                | outcome
+                | {
+                    "decision": _decision_json(
+                        load_dated_decision(connection, variant_id)
+                    ),
+                    "push": asdict(newest[0]) if newest else None,
+                },
+            )
+
+        return _Waiting(ticket, answer)
+
+    def _not_bound(self, connection: sqlite3.Connection, variant_id: str) -> _Response:
+        held = load_sku_change(connection, variant_id) is not None
+        if held or _binding_problem(connection, variant_id) is not None:
+            return self.error(
+                HTTPStatus.CONFLICT,
+                f"variant {variant_id} is not bound; `record` shows why",
+            )
+        return self.error(HTTPStatus.NOT_FOUND, f"no bound variant {variant_id}")
+
+    def rerun(self, request: _Request) -> _Response | _Waiting:
+        key = request.body.get("key")
+        if not isinstance(key, str) or not key:
+            return self.error(
+                HTTPStatus.BAD_REQUEST, "the body needs 'key' as a problem key"
+            )
+        connection = request.connection
+        parsed = parse_problem_key(key)
+        if parsed is None or get_problem(connection, *parsed) is None:
+            return self.error(HTTPStatus.NOT_FOUND, f"no problem {key}")
+        if parsed[0] is ProblemKind.STALE_PUSH and dry_run(connection):
+            return self.error(
+                HTTPStatus.CONFLICT,
+                "dry run is on, and a pass in dry run does not check stale pushes;"
+                " turn dry run off to recheck it",
+            )
+        self.audit_mutation(request, RERUN_ACTION, {"key": key})
+        ticket = self._worker.request_pass(full=True)
+
+        def answer(result: PassResult) -> _Response:
+            problem = get_problem(connection, *parsed)
+            # Problems are never deleted.
+            assert problem is not None
+            return self.json(
+                HTTPStatus.OK,
+                {
+                    "key": key,
+                    "dry_run": dry_run(connection),
+                    "pass": result,
+                    "problem": _problem_json(problem),
+                },
+            )
+
+        return _Waiting(ticket, answer)
 
     def audit_mutation(
         self, request: _Request, action: str, detail: Mapping[str, object]
@@ -569,7 +729,7 @@ class ApiServer:
         return max(0.0, (self._clock() - oldest).total_seconds())
 
 
-_ROUTES: Mapping[str, _Route] = {
+_ROUTES: Mapping[str, _Route | _WaitingRoute] = {
     "/status": _Route("GET", _Access.OPERATOR, ApiServer.status),
     "/metrics": _Route("GET", _Access.METRICS, ApiServer.metrics),
     "/problems": _Route("GET", _Access.OPERATOR, ApiServer.problems),
@@ -583,7 +743,30 @@ _ROUTES: Mapping[str, _Route] = {
     "/bindings/accept-sku-change": _Route(
         "POST", _Access.OPERATOR, ApiServer.accept_sku_change
     ),
+    "/push": _WaitingRoute("POST", _Access.OPERATOR, ApiServer.push),
+    "/rerun": _WaitingRoute("POST", _Access.OPERATOR, ApiServer.rerun),
 }
+
+
+def _binding_problem(
+    connection: sqlite3.Connection, variant_id: str
+) -> StoredProblem | None:
+    """The open problem saying why the variant is not bound, if any."""
+    return next(
+        (
+            problem
+            for kind in BINDING_PROBLEM_KINDS
+            if (problem := get_problem(connection, kind, variant_id)) is not None
+            and problem.resolved_at is None
+        ),
+        None,
+    )
+
+
+def _decision_json(decision: DatedDecision | None) -> dict[str, object] | None:
+    if decision is None:
+        return None
+    return asdict(decision.decision) | {"decided_at": decision.decided_at}
 
 
 def _problem_json(problem: StoredProblem) -> dict[str, object]:
@@ -697,6 +880,8 @@ class _Handler(BaseHTTPRequestHandler):
             with closing(api.connect()) as connection:
                 query = dict(parse_qsl(url.query))
                 request = _Request(connection, self._operator, query, body)
+                if isinstance(route, _WaitingRoute):
+                    return api.mutate_and_wait(route, request)
                 if route.method != "GET":
                     return api.mutate(route, request)
                 # One read transaction, so every statement of the handler sees

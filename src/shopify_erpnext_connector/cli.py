@@ -25,6 +25,7 @@ import httpx
 
 from shopify_erpnext_connector.api import (
     ENVIRONMENT_HEADER,
+    PASS_WAIT_TIMEOUT_SECONDS,
     WRITER_LOCK_TIMEOUT_SECONDS,
 )
 from shopify_erpnext_connector.config import (
@@ -35,6 +36,7 @@ from shopify_erpnext_connector.config import (
 )
 from shopify_erpnext_connector.problems import CLI_NAME
 from shopify_erpnext_connector.service import serve
+from shopify_erpnext_connector.worker import PassResult
 
 ENV_VARIABLE = "CONNECTOR_ENV"
 SERVE_COMMAND = "serve"
@@ -42,6 +44,8 @@ DEFAULT_ENVIRONMENT = Environment.STAGING
 REQUEST_TIMEOUT_SECONDS = 30.0
 # A mutation's answer can wait for the connector's pass to release its lock.
 MUTATION_TIMEOUT_SECONDS = WRITER_LOCK_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS
+# `push` and `rerun` then wait for the pass they asked for.
+WAITING_MUTATION_TIMEOUT_SECONDS = MUTATION_TIMEOUT_SECONDS + PASS_WAIT_TIMEOUT_SECONDS
 EXIT_FAILURE = 1
 # Visible ASCII: what an HTTP header value can carry unchanged.
 _BEARER_TOKEN = re.compile(r"[!-~]+")
@@ -123,6 +127,7 @@ def request(
     *,
     params: Mapping[str, str] | None = None,
     body: JsonObject | None = None,
+    timeout: float = REQUEST_TIMEOUT_SECONDS,
 ) -> JsonObject:
     """GET `path` from the target's API, or POST `body` to it if given.
 
@@ -138,14 +143,14 @@ def request(
                 target.url + path,
                 params=params,
                 headers=headers,
-                timeout=REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         else:
             response = httpx.post(
                 target.url + path,
                 json=body,
                 headers=headers,
-                timeout=MUTATION_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
     # InvalidURL is not an HTTPError.
     except httpx.InvalidURL as error:
@@ -387,17 +392,20 @@ def _decision_lines(document: JsonObject) -> list[str]:
     return lines
 
 
+def _push_line(push: JsonObject) -> str:
+    return (
+        f"{push.get('attempted_at')}  {push.get('available')}"
+        f" (from {_quantity(push.get('change_from'))})  {push.get('outcome')}"
+    )
+
+
 def _history_lines(document: JsonObject) -> list[str]:
     history = _objects(document, "push_history")
     if not history:
         return ["Push history: none"]
     return [
         "Push history, newest first:",
-        *(
-            f"  {push.get('attempted_at')}  {push.get('available')}"
-            f" (from {_quantity(push.get('change_from'))})  {push.get('outcome')}"
-            for push in history
-        ),
+        *(f"  {_push_line(push)}" for push in history),
     ]
 
 
@@ -463,6 +471,79 @@ def _render_accepted_sku_change(document: JsonObject) -> str:
     )
 
 
+def _unfinished(document: JsonObject, ended_early: str, later: str) -> list[str]:
+    """Why the waited-for pass shows nothing, or [] if it completed."""
+    try:
+        result = PassResult(_field(document, "pass", str))
+    except ValueError:
+        raise _malformed("pass") from None
+    if result is PassResult.COMPLETED:
+        return []
+    if result is PassResult.ENDED_EARLY:
+        return [ended_early, "The connector's log and `status` show why."]
+    return [
+        "The pass did not end within the connector's wait;"
+        " the connector still runs it.",
+        later,
+    ]
+
+
+def _render_push(document: JsonObject) -> str:
+    lines = [_environment_line(document)]
+    variant_id = _optional(document, "variant_id", str)
+    if variant_id is None:
+        count = _field(document, "item_count", int)
+        lines.append(
+            f"Marked {count} bound item{'' if count == 1 else 's'} for a push."
+        )
+        unfinished = _unfinished(
+            document,
+            "The pass ended early; the pushes may not have happened.",
+            "The items stay marked for the next pass.",
+        )
+        if unfinished:
+            return "\n".join([*lines, *unfinished])
+        left = _field(document, "still_dirty", int)
+        lines.append(
+            f"After the pass, {left} still wait{'s' if left == 1 else ''} to be pushed."
+            if left
+            else "After the pass, none waits to be pushed."
+        )
+    else:
+        lines.append(f"Variant: {variant_id} (item {document.get('item_code')})")
+        unfinished = _unfinished(
+            document,
+            "The pass ended early; the push may not have happened.",
+            f"Check `record {variant_id}` later.",
+        )
+        if unfinished:
+            return "\n".join([*lines, *unfinished])
+        lines.extend(_decision_lines(document))
+        push = _optional_object(document, "push")
+        lines.append(f"Newest push: {'none' if push is None else _push_line(push)}")
+    if _field(document, "dry_run", bool):
+        lines.append("Dry run is on: computed, nothing pushed.")
+    return "\n".join(lines)
+
+
+def _render_rerun(document: JsonObject) -> str:
+    key = _field(document, "key", str)
+    lines = [_environment_line(document), f"Problem: {key}"]
+    unfinished = _unfinished(
+        document,
+        "The full pass ended early; the problem may not have been rechecked.",
+        f"Check `problems show {key}` later.",
+    )
+    if unfinished:
+        return "\n".join([*lines, *unfinished])
+    resolved_at = _optional(_object(document, "problem"), "resolved_at", str)
+    state = "still open" if resolved_at is None else f"cleared at {resolved_at}"
+    lines.append(f"After a full pass: {state}")
+    if _field(document, "dry_run", bool):
+        lines.append("Dry run is on: rechecked, nothing pushed.")
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class _Read:
     """A read command: the API path, its parameters and the text rendering."""
@@ -478,15 +559,17 @@ class _Read:
 
 @dataclass(frozen=True)
 class _Write:
-    """A mutation: the API path, its JSON body and the text rendering."""
+    """A mutation: the API path, its JSON body, the text rendering, and how
+    long to wait for the answer."""
 
     mutation: ClassVar[bool] = True
     path: str
     render: Callable[[JsonObject], str]
     body: Callable[[Mapping[str, object]], JsonObject]
+    timeout: float = MUTATION_TIMEOUT_SECONDS
 
     def send(self, target: Target, values: Mapping[str, object]) -> JsonObject:
-        return request(target, self.path, body=self.body(values))
+        return request(target, self.path, body=self.body(values), timeout=self.timeout)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -566,6 +649,38 @@ def _parser() -> argparse.ArgumentParser:
     dry_run.add_argument("state", choices=[_ON, _OFF])
     dry_run.set_defaults(
         call=_Write("/dry-run", _render_dry_run, lambda v: {"on": v["state"] == _ON})
+    )
+    push = commands.add_parser(
+        "push",
+        parents=[common],
+        help="compute and push a variant, or every bound variant, now",
+    )
+    push_target = push.add_mutually_exclusive_group(required=True)
+    push_target.add_argument("variant", nargs="?", help="the variant's GID")
+    push_target.add_argument(
+        "--all", action="store_true", help="push every bound variant"
+    )
+    push.set_defaults(
+        call=_Write(
+            "/push",
+            _render_push,
+            lambda v: {"all": True} if v["all"] else {"variant": str(v["variant"])},
+            WAITING_MUTATION_TIMEOUT_SECONDS,
+        )
+    )
+    rerun = commands.add_parser(
+        "rerun",
+        parents=[common],
+        help="run a full pass now and report whether a problem is still open",
+    )
+    rerun.add_argument("key", help="the problem's kind:subject")
+    rerun.set_defaults(
+        call=_Write(
+            "/rerun",
+            _render_rerun,
+            lambda v: {"key": str(v["key"])},
+            WAITING_MUTATION_TIMEOUT_SECONDS,
+        )
     )
     return parser
 
