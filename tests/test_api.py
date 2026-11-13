@@ -1305,7 +1305,7 @@ def test_accepting_a_sku_change_while_a_pass_holds_the_lock_is_refused(
     assert worker.full_passes_requested == 0
 
 
-def test_a_mutation_outwaits_one_upstream_call() -> None:
+def test_a_mutation_outwaits_one_upstream_attempt() -> None:
     assert api.WRITER_LOCK_TIMEOUT_SECONDS > READ_TIMEOUT_SECONDS
 
 

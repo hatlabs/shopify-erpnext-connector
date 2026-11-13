@@ -88,9 +88,10 @@ SHUTDOWN_POLL_SECONDS = 0.1
 # A client that sends nothing for this long is disconnected, so a stalled
 # connection cannot hold a handler thread for good.
 REQUEST_TIMEOUT_SECONDS = 30.0
-# How long a mutation waits for a running pass to release the writer lock: a
-# pass holds it across upstream calls, so at least as long as one call can
-# take, with room for the connect and the pass's own work.
+# How long a mutation waits for a running pass to release the writer lock. A
+# pass holds it across upstream calls; this outlasts one attempt's read
+# timeout, with room for the connect, but not a retried call or a whole slow
+# pass, after which the mutation answers 503 and the operator retries.
 WRITER_LOCK_MARGIN_SECONDS = 30.0
 WRITER_LOCK_TIMEOUT_SECONDS = READ_TIMEOUT_SECONDS + WRITER_LOCK_MARGIN_SECONDS
 # Request bodies hold a few identifiers; anything larger is refused unread.
