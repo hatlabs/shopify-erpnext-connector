@@ -48,6 +48,9 @@ PASS_STALE_AFTER = timedelta(minutes=5)
 
 # How often the serving loop checks for `close`, so stopping takes at most this.
 SHUTDOWN_POLL_SECONDS = 0.1
+# A client that sends nothing for this long is disconnected, so a stalled
+# connection cannot hold a handler thread for good.
+REQUEST_TIMEOUT_SECONDS = 30.0
 
 _BEARER_SCHEME = "bearer"
 
@@ -134,7 +137,9 @@ class ApiServer:
         worker: WorkerState,
         *,
         clock: Callable[[], datetime] = _utc_now,
+        request_timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> None:
+        self.request_timeout = request_timeout
         self._config = config
         self._worker = worker
         self._clock = clock
@@ -325,6 +330,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._operator: str | None = None
         super().__init__(request, client_address, server)
 
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(self._api.request_timeout)
+
     def do_GET(self) -> None:
         self._send(self._respond())
 
@@ -388,10 +397,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
         _log.info(
-            '%s %s "%s" %s',
+            # The query string is left out: a client may put a token there.
+            "%s %s %s %s %s",
             self.client_address[0],
             self._operator or "-",
-            self.requestline,
+            self.command,
+            urlsplit(self.path).path,
             code,
         )
 

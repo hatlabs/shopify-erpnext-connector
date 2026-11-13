@@ -1,4 +1,5 @@
 import logging
+import socket
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -23,6 +24,7 @@ from shopify_erpnext_connector.store import open_store, set_dry_run, utc_timesta
 
 NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
 ALICE_TOKEN = "test-alice-token"
+REQUEST_TIMEOUT_SECONDS = 0.5
 BOB_TOKEN = "test-bob-token"
 METRICS_TOKEN = "test-metrics-token"
 # Kept apart from its value so the fixture check's header pattern stays meaningful.
@@ -83,7 +85,9 @@ def server(store_path: Path, worker: FakeWorker, clock: Clock) -> Iterator[ApiSe
             operator_tokens={"alice": Secret(ALICE_TOKEN), "bob": Secret(BOB_TOKEN)},
         ),
     )
-    server = ApiServer(config, worker, clock=clock)
+    server = ApiServer(
+        config, worker, clock=clock, request_timeout=REQUEST_TIMEOUT_SECONDS
+    )
     server.start()
     yield server
     server.close()
@@ -146,6 +150,25 @@ def test_wrong_token_is_rejected_without_appearing_in_logs(
     assert wrong not in logs.text
     for token in (ALICE_TOKEN, BOB_TOKEN, METRICS_TOKEN):
         assert token not in logs.text
+
+
+def test_query_string_is_left_out_of_the_request_log(
+    client: httpx.Client, logs: pytest.LogCaptureFixture
+) -> None:
+    misplaced = "test-token-in-query"
+
+    response = client.get(f"/status?token={misplaced}", headers=operator())
+
+    assert response.status_code == 200
+    assert "/status" in logs.text
+    assert misplaced not in logs.text
+
+
+def test_a_stalled_connection_is_closed(server: ApiServer) -> None:
+    with socket.create_connection(("127.0.0.1", server.port), timeout=5) as stalled:
+        stalled.sendall(b"GET /status HTTP/1.1\r\n")
+
+        assert stalled.recv(1024) == b""
 
 
 @pytest.mark.parametrize("value", [f"Basic {ALICE_TOKEN}", ALICE_TOKEN, "Bearer"])
