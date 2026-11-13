@@ -29,7 +29,10 @@ from shopify_erpnext_connector.store import open_store
 NOW = datetime(2026, 11, 12, 10, 0, tzinfo=UTC)
 VARIANT = "gid://shopify/ProductVariant/1001"
 OTHER_VARIANT = "gid://shopify/ProductVariant/1002"
-SHOW_COMMAND = f"shopify-erpnext-connector problems show unbound_sku:{VARIANT}"
+# run_pass sends from production by default.
+SHOW_COMMAND = (
+    f"shopify-erpnext-connector --env production problems show unbound_sku:{VARIANT}"
+)
 ONE_SECOND = timedelta(seconds=1)
 COMMUNICATION_PATH = "/api/resource/Communication"
 
@@ -371,6 +374,17 @@ def test_attempts_survive_a_restart(db_path: Path, erpnext: FakeErpNext) -> None
     assert len(erpnext.make_calls) == 2
     assert email_attempts(second) == 2
     second.close()
+
+
+def test_staging_email_command_asks_staging(
+    store: sqlite3.Connection, erpnext: FakeErpNext
+) -> None:
+    staging = make_config(environment=Environment.STAGING, email_enabled=True)
+
+    run_pass(store, erpnext, [unbound()], config=staging)
+
+    (call,) = erpnext.make_calls
+    assert SHOW_COMMAND.replace("production", "staging") in str(call["content"])
 
 
 def test_sending_disabled_records_the_problem_without_calling_erpnext(

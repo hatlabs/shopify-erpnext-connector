@@ -110,6 +110,9 @@ _POLICY_TEXTS = {
     "CONTINUE": "Keeps selling at zero: a build is needed",
 }
 
+# The binding problems' detail naming the variant's current SKU.
+SKU_DETAIL = "SKU"
+
 _BINDING_PROBLEM_KINDS = {
     UnboundKind.EMPTY_SKU: ProblemKind.UNBOUND_SKU,
     UnboundKind.NO_ITEM: ProblemKind.UNBOUND_SKU,
@@ -120,6 +123,9 @@ _BINDING_PROBLEM_KINDS = {
     UnboundKind.NON_STOCK_ITEM: ProblemKind.AMBIGUOUS_SKU,
     UnboundKind.SKU_CHANGED: ProblemKind.CHANGED_SKU,
 }
+# Every problem kind that says why a variant is not bound. `record` reports the
+# first open one in this order.
+BINDING_PROBLEM_KINDS = tuple(dict.fromkeys(_BINDING_PROBLEM_KINDS.values()))
 _BINDING_REASONS = {
     UnboundKind.EMPTY_SKU: "The variant has no SKU",
     UnboundKind.NO_ITEM: "No ERPNext Item has this item code",
@@ -221,6 +227,11 @@ class Worker:
     def last_pass_full(self) -> bool:
         return self._last_pass_full
 
+    @property
+    def last_full_pass_at(self) -> datetime | None:
+        """When the last full pass that completed started; None before the first."""
+        return self._last_full_pass_at
+
     def run(self, stop: threading.Event) -> None:
         interval = self._config.worker.poll_interval.total_seconds()
         while not stop.is_set():
@@ -266,7 +277,6 @@ class Worker:
                     now,
                     self._config.worker.push_stale_after,
                     location_id=self._config.location_id,
-                    waiting_since=_dirty_since(connection),
                 )
                 record_check(
                     connection,
@@ -546,7 +556,7 @@ def _oversell(computed: _Computed, match: OrderMatch) -> Problem:
 
 def _binding_details(variant: UnboundVariant) -> dict[str, str]:
     details = {
-        "SKU": variant.sku or "(none)",
+        SKU_DETAIL: variant.sku or "(none)",
         "Reason": _BINDING_REASONS[variant.kind],
     }
     if variant.kind is UnboundKind.NEAR_MATCH:
@@ -558,13 +568,3 @@ def _binding_details(variant: UnboundVariant) -> dict[str, str]:
     if variant.other_variant_ids:
         details["Other variants"] = ", ".join(variant.other_variant_ids)
     return details
-
-
-def _dirty_since(connection: sqlite3.Connection) -> dict[str, str]:
-    """When each bound variant's item was marked dirty, by variant ID."""
-    dirty = dirty_items(connection)
-    return {
-        b.variant_id: dirty[b.item_code].marked_at
-        for b in load_bindings(connection)
-        if b.item_code in dirty
-    }

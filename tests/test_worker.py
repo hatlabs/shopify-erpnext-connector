@@ -33,6 +33,7 @@ from shopify_erpnext_connector.store import (
     utc_timestamp,
 )
 from shopify_erpnext_connector.worker import (
+    BINDING_PROBLEM_KINDS,
     EMAIL_CHECK_INTERVAL,
     FULL_PASS_INTERVAL,
     HELD_ACTION,
@@ -1029,6 +1030,19 @@ def test_a_full_pass_runs_at_start_and_then_hourly(world: World) -> None:
     assert world.worker.last_pass_at == NOW + FULL_PASS_INTERVAL
 
 
+def test_last_full_pass_at_is_the_start_of_the_last_completed_full_pass(
+    world: World,
+) -> None:
+    world.bind(1, actual=3, available=3)
+    assert world.worker.last_full_pass_at is None
+
+    world.worker.run_pass(NOW)
+    world.worker.run_pass(NOW + SECOND)
+
+    assert world.worker.last_full_pass_at == NOW
+    assert world.worker.last_pass_at == NOW + SECOND
+
+
 def test_a_hand_edit_is_overwritten_and_noted_without_a_problem(
     world: World,
 ) -> None:
@@ -1358,6 +1372,20 @@ def test_incremental_passes_continue_while_a_full_pass_waits(world: World) -> No
     assert world.shopify.mutations == [[(inventory_item_id(1), 4, 3)]]
 
 
+def test_a_failed_full_pass_leaves_last_full_pass_at_unchanged(
+    world: World,
+) -> None:
+    world.bind(1, actual=3, available=3)
+    world.worker.run_pass(NOW)
+    world.erpnext.failing.add("Item")
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL)
+
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL + SECOND)
+
+    assert world.worker.last_full_pass_at == NOW
+    assert world.worker.last_pass_at == NOW + FULL_PASS_INTERVAL + SECOND
+
+
 def test_run_passes_until_stopped(world: World) -> None:
     world.bind(1, actual=3, available=0)
     stop = threading.Event()
@@ -1408,3 +1436,11 @@ def test_comparison_report_lists_each_bound_variant(world: World) -> None:
         ),
     ]
     assert world.shopify.mutations == []
+
+
+def test_binding_problem_kinds_are_unbound_ambiguous_then_changed() -> None:
+    assert BINDING_PROBLEM_KINDS == (
+        ProblemKind.UNBOUND_SKU,
+        ProblemKind.AMBIGUOUS_SKU,
+        ProblemKind.CHANGED_SKU,
+    )

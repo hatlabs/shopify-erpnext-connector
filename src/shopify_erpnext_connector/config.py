@@ -20,6 +20,8 @@ OPERATOR_TOKEN_PREFIX = "operator_token_"
 DEFAULT_STORE_PATH = "/var/lib/shopify-erpnext-connector/connector.sqlite3"
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 DEFAULT_PUSH_STALE_AFTER_MINUTES = 30
+DEFAULT_API_PORT = 8080
+_MAX_PORT = 65535
 
 _SHOP_DOMAIN = re.compile(r"(?:[a-z0-9-]+\.)+myshopify\.com")
 _LOCATION_ID = re.compile(r"gid://shopify/Location/[0-9]+")
@@ -38,6 +40,7 @@ _SCHEMA: _Schema = {
     "erpnext": {"url": None, "warehouse": None},
     "email": {"enabled": None, "recipient": None, "sender": None},
     "worker": {"poll_interval_seconds": None, "push_stale_after_minutes": None},
+    "api": {"port": None},
 }
 
 
@@ -78,12 +81,12 @@ class Secrets:
     @classmethod
     def read(cls, directory: Path, operators: Sequence[str]) -> "Secrets":
         return cls(
-            erpnext_api_key=_read_secret(directory, "erpnext_api_key"),
-            erpnext_api_secret=_read_secret(directory, "erpnext_api_secret"),
-            shopify_access_token=_read_secret(directory, "shopify_access_token"),
-            metrics_token=_read_secret(directory, "metrics_token"),
+            erpnext_api_key=read_secret(directory / "erpnext_api_key"),
+            erpnext_api_secret=read_secret(directory / "erpnext_api_secret"),
+            shopify_access_token=read_secret(directory / "shopify_access_token"),
+            metrics_token=read_secret(directory / "metrics_token"),
             operator_tokens={
-                name: _read_secret(directory, OPERATOR_TOKEN_PREFIX + name)
+                name: read_secret(directory / (OPERATOR_TOKEN_PREFIX + name))
                 for name in operators
             },
         )
@@ -107,6 +110,13 @@ class WorkerConfig:
 
 
 @dataclass(frozen=True)
+class ApiConfig:
+    """The operator and metrics HTTP API, listening on every interface."""
+
+    port: int
+
+
+@dataclass(frozen=True)
 class Config:
     environment: Environment
     shop_domain: str
@@ -115,6 +125,7 @@ class Config:
     warehouse: str
     email: EmailConfig
     worker: WorkerConfig
+    api: ApiConfig
     store_path: Path
     secrets: Secrets
 
@@ -189,6 +200,7 @@ def load_config(config_path: Path, secrets_dir: Path) -> Config:
                 )
             ),
         ),
+        api=ApiConfig(port=document.port("api.port", DEFAULT_API_PORT)),
         store_path=Path(
             document.string("store_path")
             if document.has("store_path")
@@ -255,6 +267,14 @@ class _Document:
             raise self.error(f"'{dotted}' must be a positive whole number")
         return value
 
+    def port(self, dotted: str, default: int) -> int:
+        if not self.has(dotted):
+            return default
+        value = self.value(dotted)
+        if not is_integer(value) or not 1 <= value <= _MAX_PORT:
+            raise self.error(f"'{dotted}' must be a whole number from 1 to {_MAX_PORT}")
+        return value
+
     def string(self, dotted: str) -> str:
         value = self.value(dotted)
         if not isinstance(value, str) or not value:
@@ -299,8 +319,8 @@ def _read_toml(path: Path) -> Mapping[str, object]:
         raise ConfigError(f"{path}: invalid TOML: {error}") from None
 
 
-def _read_secret(directory: Path, name: str) -> Secret:
-    path = directory / name
+def read_secret(path: Path) -> Secret:
+    """The secret in the file at `path`, without its trailing newline."""
     # Errors name the file only: an OS or decode error message can quote content.
     try:
         text = path.read_text(encoding="utf-8")
