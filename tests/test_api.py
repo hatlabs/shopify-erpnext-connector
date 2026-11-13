@@ -1101,6 +1101,20 @@ def test_a_body_that_is_not_a_json_object_is_a_bad_request(
     assert probe == []
 
 
+def test_a_body_nested_too_deep_to_parse_is_a_bad_request(
+    client: httpx.Client, probe: list[object]
+) -> None:
+    # As deep as fits within the limit: far past the parser's recursion limit.
+    depth = MAX_BODY_BYTES // 2
+    content = b"[" * depth + b"]" * depth
+
+    response = client.post("/probe", content=content, headers=operator())
+
+    assert response.status_code == 400
+    assert "JSON" in response.json()["error"]
+    assert probe == []
+
+
 def test_a_body_past_the_limit_is_refused(
     client: httpx.Client, probe: list[object]
 ) -> None:

@@ -586,7 +586,7 @@ def _json_object(content: bytes) -> Mapping[str, object] | str:
     """The body as a JSON object, or why it is not one."""
     try:
         document: object = json.loads(content) if content else None
-    except ValueError:
+    except (ValueError, RecursionError):
         return "the body is not valid JSON"
     if not isinstance(document, dict):
         return "the body must be a JSON object"
