@@ -353,6 +353,52 @@ def test_operators_given_as_a_string_is_rejected(
         load_config(config_path, secrets_dir)
 
 
+def test_operators_sharing_a_token_are_rejected_without_showing_it(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    config_path.write_text(
+        CONFIG_TOML.replace('["alice"]', '["alice", "bob", "carol"]')
+    )
+    (secrets_dir / "operator_token_bob").write_text("test-other-token")
+    (secrets_dir / "operator_token_carol").write_text("test-operator-token\n")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_path, secrets_dir)
+
+    message = str(excinfo.value)
+    assert "alice" in message
+    assert "carol" in message
+    assert "bob" not in message
+    assert "test-operator-token" not in message
+
+
+def test_operator_token_equal_to_the_metrics_token_is_rejected_without_showing_it(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    (secrets_dir / "operator_token_alice").write_text("test-metrics-token")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(config_path, secrets_dir)
+
+    message = str(excinfo.value)
+    assert "alice" in message
+    assert str(secrets_dir / "metrics_token") in message
+    assert "test-metrics-token" not in message.replace(
+        str(secrets_dir / "metrics_token"), ""
+    )
+
+
+def test_operators_with_distinct_tokens_are_accepted(
+    config_path: Path, secrets_dir: Path
+) -> None:
+    config_path.write_text(CONFIG_TOML.replace('["alice"]', '["alice", "bob"]'))
+    (secrets_dir / "operator_token_bob").write_text("test-other-token")
+
+    tokens = load_config(config_path, secrets_dir).secrets.operator_tokens
+
+    assert set(tokens) == {"alice", "bob"}
+
+
 def test_config_without_operators_has_no_operator_tokens(
     config_path: Path, secrets_dir: Path
 ) -> None:
@@ -435,7 +481,7 @@ def test_example_config_loads(tmp_path: Path) -> None:
         "metrics_token",
         "operator_token_alice",
     ]:
-        (secrets / name).write_text("placeholder")
+        (secrets / name).write_text(f"placeholder-{name}")
 
     config = load_config(example, secrets)
     assert config.shop_domain == "example.myshopify.com"

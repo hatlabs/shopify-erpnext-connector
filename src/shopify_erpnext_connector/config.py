@@ -80,16 +80,40 @@ class Secrets:
 
     @classmethod
     def read(cls, directory: Path, operators: Sequence[str]) -> "Secrets":
+        operator_tokens = {
+            name: read_secret(directory / (OPERATOR_TOKEN_PREFIX + name))
+            for name in operators
+        }
+        _reject_shared_tokens(operator_tokens)
+        metrics_token_file = directory / "metrics_token"
+        metrics_token = read_secret(metrics_token_file)
+        for name, token in operator_tokens.items():
+            # The metrics token is scraped by monitoring; as an operator token
+            # it would let the scraper change the connector.
+            if token.reveal() == metrics_token.reveal():
+                raise ConfigError(
+                    f"operator {name} has the token in {metrics_token_file}; "
+                    "an operator token must differ from the metrics token"
+                )
         return cls(
             erpnext_api_key=read_secret(directory / "erpnext_api_key"),
             erpnext_api_secret=read_secret(directory / "erpnext_api_secret"),
             shopify_access_token=read_secret(directory / "shopify_access_token"),
-            metrics_token=read_secret(directory / "metrics_token"),
-            operator_tokens={
-                name: read_secret(directory / (OPERATOR_TOKEN_PREFIX + name))
-                for name in operators
-            },
+            metrics_token=metrics_token,
+            operator_tokens=operator_tokens,
         )
+
+
+def _reject_shared_tokens(operator_tokens: Mapping[str, Secret]) -> None:
+    """Refuse two operators with one token: the audit log could name the wrong one."""
+    first_with: dict[str, str] = {}
+    for name, token in operator_tokens.items():
+        other = first_with.setdefault(token.reveal(), name)
+        if other != name:
+            raise ConfigError(
+                f"operators {other} and {name} have the same token; "
+                "each operator needs a token of their own"
+            )
 
 
 @dataclass(frozen=True)
