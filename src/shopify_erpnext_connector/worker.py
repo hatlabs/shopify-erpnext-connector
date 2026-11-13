@@ -123,8 +123,8 @@ _BINDING_PROBLEM_KINDS = {
     UnboundKind.NON_STOCK_ITEM: ProblemKind.AMBIGUOUS_SKU,
     UnboundKind.SKU_CHANGED: ProblemKind.CHANGED_SKU,
 }
-# Every problem kind that says why a variant is not bound, in the map's
-# order: unbound, ambiguous, changed.
+# Every problem kind that says why a variant is not bound. `record` reports the
+# first open one in this order.
 BINDING_PROBLEM_KINDS = tuple(dict.fromkeys(_BINDING_PROBLEM_KINDS.values()))
 _BINDING_REASONS = {
     UnboundKind.EMPTY_SKU: "The variant has no SKU",
