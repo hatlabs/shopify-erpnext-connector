@@ -438,13 +438,18 @@ class ApiServer:
             return self.error(
                 HTTPStatus.BAD_REQUEST, "the body needs 'variant' as a variant GID"
             )
+        given_sku = request.body.get("sku")
+        if not isinstance(given_sku, str) or not given_sku:
+            return self.error(
+                HTTPStatus.BAD_REQUEST,
+                "the body needs 'sku' as the SKU that `bindings` shows",
+            )
         connection = request.connection
         change = load_sku_change(connection, variant_id)
         if change is None:
             return self.error(
                 HTTPStatus.NOT_FOUND, f"variant {variant_id} has no held SKU change"
             )
-        # The SKU `bindings` shows: the one the operator saw and accepts.
         problem = get_problem(connection, ProblemKind.CHANGED_SKU, variant_id)
         sku = (
             None
@@ -462,6 +467,12 @@ class ApiServer:
                 HTTPStatus.CONFLICT,
                 f"variant {variant_id} has no SKU in Shopify;"
                 " there is nothing to accept",
+            )
+        if sku != given_sku:
+            return self.error(
+                HTTPStatus.CONFLICT,
+                f"variant {variant_id} now has SKU {sku}, not {given_sku};"
+                " check `bindings` again",
             )
         accept_sku_change(connection, variant_id, sku)
         detail = {

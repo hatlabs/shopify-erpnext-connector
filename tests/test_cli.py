@@ -1014,7 +1014,9 @@ def test_accept_sku_change_names_the_accepted_sku(
 ) -> None:
     hold(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
 
-    code, out, err = run(capsys, "bindings", "accept-sku-change", VARIANT)
+    code, out, err = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"
+    )
 
     assert code == 0, err
     assert out.splitlines() == [
@@ -1035,7 +1037,9 @@ def test_accept_sku_change_as_json(
 ) -> None:
     hold(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
 
-    code, out, _ = run(capsys, "bindings", "accept-sku-change", VARIANT, "--json")
+    code, out, _ = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW", "--json"
+    )
 
     assert code == 0
     assert json.loads(out)["bound_item_code"] == "TEST-ITEM-001"
@@ -1045,7 +1049,9 @@ def test_accept_sku_change_as_json(
 def test_accept_sku_change_without_a_hold_is_reported(
     store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code, out, err = run(capsys, "bindings", "accept-sku-change", VARIANT)
+    code, out, err = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"
+    )
 
     assert code == cli.EXIT_FAILURE
     assert out == ""
@@ -1053,6 +1059,54 @@ def test_accept_sku_change_without_a_hold_is_reported(
     assert "404" in err
     assert f"{VARIANT} has no held SKU change" in err
     assert audit_rows(store) == []
+
+
+@pytest.mark.usefixtures("connected")
+def test_accept_sku_change_refuses_a_sku_bindings_no_longer_shows(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hold(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEWER")
+
+    code, out, err = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"
+    )
+
+    assert code == cli.EXIT_FAILURE
+    assert out == ""
+    assert "409" in err
+    assert "TEST-SKU-001-NEWER" in err
+    assert audit_rows(store) == []
+
+
+def test_accept_sku_change_posts_the_variant_and_the_sku(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    state, url = canned
+    state.answer(
+        200,
+        {
+            "environment": "staging",
+            "variant_id": VARIANT,
+            "bound_item_code": "TEST-ITEM-001",
+            "accepted_sku": "TEST-SKU-001-NEW",
+        },
+    )
+    configure(monkeypatch, tmp_path, url)
+
+    code, _, err = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"
+    )
+
+    assert code == 0, err
+    assert state.posted == [
+        (
+            "/bindings/accept-sku-change",
+            {"variant": VARIANT, "sku": "TEST-SKU-001-NEW"},
+        )
+    ]
 
 
 def test_a_mutation_posts_its_body_with_the_token_and_environment(
@@ -1076,7 +1130,10 @@ def test_a_mutation_posts_its_body_with_the_token_and_environment(
 
 @pytest.mark.parametrize(
     "argv",
-    [["dry-run", "off"], ["bindings", "accept-sku-change", VARIANT]],
+    [
+        ["dry-run", "off"],
+        ["bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"],
+    ],
 )
 def test_a_mutation_on_production_needs_env_on_the_command_line(
     monkeypatch: pytest.MonkeyPatch,

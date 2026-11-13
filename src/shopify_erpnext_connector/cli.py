@@ -537,11 +537,15 @@ def _parser() -> argparse.ArgumentParser:
         " `bindings` shows",
     )
     accept.add_argument("variant", help="the variant's GID")
+    accept.add_argument(
+        "sku",
+        help="the SKU `bindings` shows; refused if the variant's SKU changed since",
+    )
     accept.set_defaults(
         call=_Write(
             "/bindings/accept-sku-change",
             _render_accepted_sku_change,
-            lambda v: {"variant": str(v["variant"])},
+            lambda v: {"variant": str(v["variant"]), "sku": str(v["sku"])},
         )
     )
     record = commands.add_parser(
