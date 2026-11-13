@@ -1,12 +1,13 @@
 """The `shopify-erpnext-connector` executable.
 
 `serve` runs the connector service; the other commands are the operator CLI,
-which reads from a connector's API. Each environment's URL and token file
-come from `CONNECTOR_<ENV>_URL` and `CONNECTOR_<ENV>_TOKEN_FILE`; the token
-itself is read only from that file, never from a variable or an argument.
-`--env` selects the environment, defaulting to `CONNECTOR_ENV` and then to
-staging. Every answer must name the selected environment, so a URL pointing
-at the wrong connector fails instead of showing its data.
+which reads and changes a connector through its API. Each environment's URL
+and token file come from `CONNECTOR_<ENV>_URL` and `CONNECTOR_<ENV>_TOKEN_FILE`;
+the token itself is read only from that file, never from a variable or an
+argument. `--env` selects the environment, defaulting to `CONNECTOR_ENV` and
+then to staging; a command that changes production requires `--env production`
+on the command line. Every answer must name the selected environment, so a URL
+pointing at the wrong connector fails instead of showing its data.
 """
 
 import argparse
@@ -22,7 +23,10 @@ from typing import TypeVar
 
 import httpx
 
-from shopify_erpnext_connector.api import ENVIRONMENT_HEADER
+from shopify_erpnext_connector.api import (
+    ENVIRONMENT_HEADER,
+    WRITER_LOCK_TIMEOUT_SECONDS,
+)
 from shopify_erpnext_connector.config import (
     ConfigError,
     Environment,
@@ -36,6 +40,8 @@ ENV_VARIABLE = "CONNECTOR_ENV"
 SERVE_COMMAND = "serve"
 DEFAULT_ENVIRONMENT = Environment.STAGING
 REQUEST_TIMEOUT_SECONDS = 30.0
+# A mutation's answer can wait for the connector's pass to release its lock.
+MUTATION_TIMEOUT_SECONDS = WRITER_LOCK_TIMEOUT_SECONDS + REQUEST_TIMEOUT_SECONDS
 EXIT_FAILURE = 1
 # Visible ASCII: what an HTTP header value can carry unchanged.
 _BEARER_TOKEN = re.compile(r"[!-~]+")
@@ -58,22 +64,22 @@ def token_file_variable(environment: Environment) -> str:
 
 @dataclass(frozen=True)
 class Target:
-    """The connector a command talks to.
-
-    `explicit` is true when `--env` was given on the command line rather than
-    taken from `CONNECTOR_ENV` or the default: a mutation on production
-    requires it.
-    """
+    """The connector a command talks to."""
 
     environment: Environment
-    explicit: bool
     url: str
     token_file: Path
     token: Secret
 
 
-def resolve_target(env_option: str | None, environ: Mapping[str, str]) -> Target:
-    """The target for `--env` (None when not given) and the variables."""
+def resolve_target(
+    env_option: str | None, environ: Mapping[str, str], *, mutation: bool = False
+) -> Target:
+    """The target for `--env` (None when not given) and the variables.
+
+    A mutation on production is refused unless `--env` named it, before the
+    token is read.
+    """
     if env_option is not None:
         environment = Environment(env_option)
     else:
@@ -85,6 +91,11 @@ def resolve_target(env_option: str | None, environ: Mapping[str, str]) -> Target
             raise CliError(
                 f"{ENV_VARIABLE} is {name!r}, not one of {choices}"
             ) from None
+    if mutation and environment is Environment.PRODUCTION and env_option is None:
+        raise CliError(
+            f"{ENV_VARIABLE} selects production; a command that changes production"
+            " needs --env production on the command line"
+        )
     url = _variable(environ, url_variable(environment))
     token_file = Path(_variable(environ, token_file_variable(environment)))
     try:
@@ -96,9 +107,7 @@ def resolve_target(env_option: str | None, environ: Mapping[str, str]) -> Target
         raise CliError(
             f"operator token: {token_file} holds characters a bearer token cannot carry"
         )
-    return Target(
-        environment, env_option is not None, url.rstrip("/"), token_file, token
-    )
+    return Target(environment, url.rstrip("/"), token_file, token)
 
 
 def _variable(environ: Mapping[str, str], name: str) -> str:
@@ -108,19 +117,36 @@ def _variable(environ: Mapping[str, str], name: str) -> str:
     return value
 
 
-def fetch(target: Target, path: str, params: Mapping[str, str]) -> JsonObject:
-    """GET `path` from the target's API; the answer must name its environment."""
+def request(
+    target: Target,
+    path: str,
+    *,
+    params: Mapping[str, str] | None = None,
+    body: JsonObject | None = None,
+) -> JsonObject:
+    """GET `path` from the target's API, or POST `body` to it if given.
+
+    The answer must name the target's environment.
+    """
     headers = {
         "Authorization": f"Bearer {target.token.reveal()}",
         ENVIRONMENT_HEADER: target.environment,
     }
     try:
-        response = httpx.get(
-            target.url + path,
-            params=params,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
+        if body is None:
+            response = httpx.get(
+                target.url + path,
+                params=params,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        else:
+            response = httpx.post(
+                target.url + path,
+                json=body,
+                headers=headers,
+                timeout=MUTATION_TIMEOUT_SECONDS,
+            )
     # InvalidURL is not an HTTPError.
     except httpx.InvalidURL as error:
         raise CliError(
@@ -208,8 +234,12 @@ def _quantity(value: object) -> str:
     return str(value)
 
 
+_ON = "on"
+_OFF = "off"
+
+
 def _on_off(value: bool) -> str:
-    return "on" if value else "off"
+    return _ON if value else _OFF
 
 
 def _environment_line(document: JsonObject) -> str:
@@ -400,6 +430,26 @@ def _render_report(document: JsonObject) -> str:
     return "\n".join([*lines, *_table(headers, cells)])
 
 
+def _render_dry_run(document: JsonObject) -> str:
+    on = _field(document, "dry_run", bool)
+    if _field(document, "changed", bool):
+        state = f"Dry run: {_on_off(on)}, was {_on_off(not on)}"
+    else:
+        state = f"Dry run: already {_on_off(on)}; nothing changed"
+    return "\n".join([_environment_line(document), state])
+
+
+def _render_accepted_sku_change(document: JsonObject) -> str:
+    return "\n".join(
+        [
+            _environment_line(document),
+            f"Accepted the new SKU of {_field(document, 'variant_id', str)},"
+            f" which was bound to {_field(document, 'bound_item_code', str)}.",
+            "The next pass binds it by its new SKU.",
+        ]
+    )
+
+
 @dataclass(frozen=True)
 class _Read:
     """A read command: the API path, its parameters and the text rendering."""
@@ -407,6 +457,15 @@ class _Read:
     path: str
     render: Callable[[JsonObject], str]
     params: Callable[[Mapping[str, object]], dict[str, str]] = lambda _: {}
+
+
+@dataclass(frozen=True)
+class _Write:
+    """A mutation: the API path, its JSON body and the text rendering."""
+
+    path: str
+    render: Callable[[JsonObject], str]
+    body: Callable[[Mapping[str, object]], JsonObject]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -432,23 +491,37 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser(
         "status", parents=[common], help="last pass, push lag, dry-run and problems"
     )
-    status.set_defaults(read=_Read("/status", _render_status))
+    status.set_defaults(call=_Read("/status", _render_status))
     problems = commands.add_parser(
         "problems", parents=[common], help="list open problems, or show one"
     )
-    problems.set_defaults(read=_Read("/problems", _render_problems))
+    problems.set_defaults(call=_Read("/problems", _render_problems))
     show = problems.add_subparsers(dest="action").add_parser(
         "show", parents=[common], help="show one problem, open or resolved"
     )
     show.add_argument("key", help="the problem's kind:subject, as its email names it")
     show.set_defaults(
-        read=_Read("/problem", _render_problem, lambda v: {"key": str(v["key"])})
+        call=_Read("/problem", _render_problem, lambda v: {"key": str(v["key"])})
     )
-    commands.add_parser(
+    bindings = commands.add_parser(
         "bindings",
         parents=[common],
         help="unbound and ambiguous variants, and variants held after a SKU change",
-    ).set_defaults(read=_Read("/bindings", _render_bindings))
+    )
+    bindings.set_defaults(call=_Read("/bindings", _render_bindings))
+    accept = bindings.add_subparsers(dest="action").add_parser(
+        "accept-sku-change",
+        parents=[common],
+        help="let a variant held after its SKU changed bind by its new SKU",
+    )
+    accept.add_argument("variant", help="the variant's GID")
+    accept.set_defaults(
+        call=_Write(
+            "/bindings/accept-sku-change",
+            _render_accepted_sku_change,
+            lambda v: {"variant": str(v["variant"])},
+        )
+    )
     record = commands.add_parser(
         "record",
         parents=[common],
@@ -456,11 +529,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     record.add_argument("variant", help="the variant's GID")
     record.set_defaults(
-        read=_Read("/record", _render_record, lambda v: {"variant": str(v["variant"])})
+        call=_Read("/record", _render_record, lambda v: {"variant": str(v["variant"])})
     )
     commands.add_parser(
         "report", parents=[common], help="the cutover dry-run comparison"
-    ).set_defaults(read=_Read("/report", _render_report))
+    ).set_defaults(call=_Read("/report", _render_report))
+    dry_run = commands.add_parser(
+        "dry-run", parents=[common], help="turn dry-run on or off"
+    )
+    dry_run.add_argument("state", choices=[_ON, _OFF])
+    dry_run.set_defaults(
+        call=_Write("/dry-run", _render_dry_run, lambda v: {"on": v["state"] == _ON})
+    )
     return parser
 
 
@@ -474,20 +554,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         if values.get("json"):
             parser.error("serve has no --json output")
         return serve()
-    read = values["read"]
-    assert isinstance(read, _Read)
+    call = values["call"]
+    assert isinstance(call, _Read | _Write)
     try:
         target = resolve_target(
-            env_option if isinstance(env_option, str) else None, os.environ
+            env_option if isinstance(env_option, str) else None,
+            os.environ,
+            mutation=isinstance(call, _Write),
         )
     except CliError as error:
         return _fail(str(error))
     try:
-        document = fetch(target, read.path, read.params(values))
+        if isinstance(call, _Write):
+            document = request(target, call.path, body=call.body(values))
+        else:
+            document = request(target, call.path, params=call.params(values))
         output = (
             json.dumps(document, indent=2)
             if values.get("json")
-            else read.render(document)
+            else call.render(document)
         )
     except CliError as error:
         # Named so that an answer such as "no problem" cannot be read as
