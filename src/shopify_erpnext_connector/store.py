@@ -185,8 +185,13 @@ def purge_push_history(connection: sqlite3.Connection, now: datetime) -> int:
 
 @contextmanager
 def transaction(connection: sqlite3.Connection) -> Generator[None]:
-    """Commit the block's writes together, or roll them all back on an error."""
-    connection.execute("BEGIN")
+    """Commit the block's writes together, or roll them all back on an error.
+
+    The write lock is taken at the start: a writer on another connection
+    committing between this block's reads and its first write would make
+    SQLite refuse that write instead of waiting.
+    """
+    connection.execute("BEGIN IMMEDIATE")
     try:
         yield
         connection.execute("COMMIT")
