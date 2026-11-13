@@ -176,7 +176,7 @@ def render_body(problem: StoredProblem, environment: Environment) -> str:
         f"<td>{html.escape(value)}</td></tr>"
         for label, value in rows
     )
-    command = html.escape(show_command(problem.kind, problem.subject))
+    command = html.escape(show_command(problem.kind, problem.subject, environment))
     return (
         f"<p>{CLI_NAME} ({environment}) found a problem: "
         f"<strong>{text.title}</strong>.</p>\n"

@@ -635,7 +635,8 @@ def test_the_command_in_a_problem_email_shows_the_problem(
     store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
 ) -> None:
     oversold(store, VARIANT)
-    program, *argv = shlex.split(show_command(ProblemKind.OVERSELL, VARIANT))
+    command = show_command(ProblemKind.OVERSELL, VARIANT, Environment.STAGING)
+    program, *argv = shlex.split(command)
 
     code, out, err = run(capsys, *argv)
 
@@ -646,6 +647,48 @@ def test_the_command_in_a_problem_email_shows_the_problem(
     assert "Short by: 2" in out
     assert f"Opened: {utc_timestamp(NOW)}" in out
     assert "Email: pending" in out
+
+
+def test_the_command_in_a_production_email_asks_production(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    store_path: Path,
+    store: sqlite3.Connection,
+    api_url: str,
+) -> None:
+    config = make_config(environment=Environment.PRODUCTION)
+    production = ApiServer(
+        replace(
+            config,
+            store_path=store_path,
+            api=ApiConfig(port=0),
+            secrets=replace(
+                config.secrets, operator_tokens={"alice": Secret(OPERATOR_TOKEN)}
+            ),
+        ),
+        FakeWorker(),
+    )
+    production.start()
+    try:
+        # The operator's shell selects no environment, so it would ask staging.
+        configure(monkeypatch, tmp_path, api_url)
+        configure(
+            monkeypatch,
+            tmp_path,
+            f"http://127.0.0.1:{production.port}",
+            Environment.PRODUCTION,
+        )
+        oversold(store, VARIANT)
+        command = show_command(ProblemKind.OVERSELL, VARIANT, Environment.PRODUCTION)
+
+        code, out, err = run(capsys, *shlex.split(command)[1:])
+    finally:
+        production.close()
+
+    assert code == 0, err
+    assert "Environment: production" in out
+    assert f"Problem: oversell:{VARIANT}" in out
 
 
 @pytest.mark.usefixtures("connected")

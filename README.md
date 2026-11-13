@@ -47,7 +47,7 @@ CONNECTOR_PRODUCTION_TOKEN_FILE=/path/to/production-operator-token
 |---|---|
 | `status` | last pass, push lag, dry-run, open problems and unsent emails |
 | `problems` | the open problems |
-| `problems show <kind:subject>` | one problem, its details and email state; problem emails name this command |
+| `problems show <kind:subject>` | one problem, its details and email state; problem emails name this command with the connector's `--env` |
 | `bindings` | unbound and ambiguous variants, and variants held after their SKU changed |
 | `record <variant GID>` | a variant's binding, the explanation of its sellable stock and its recent pushes |
 | `report` | the cutover dry-run comparison of computed and current Shopify values |

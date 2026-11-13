@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from shopify_erpnext_connector.config import Environment
 from shopify_erpnext_connector.problems import (
     Problem,
     ProblemKind,
@@ -357,14 +358,22 @@ def test_unsent_count_covers_open_problems_awaiting_delivery(
 
 def test_problem_key_and_show_command_name_the_problem() -> None:
     assert problem_key(ProblemKind.UNBOUND_SKU, VARIANT) == f"unbound_sku:{VARIANT}"
-    assert show_command(ProblemKind.UNMIRRORED_ORDER, "5550001") == (
-        "shopify-erpnext-connector problems show unmirrored_order:5550001"
+    command = show_command(
+        ProblemKind.UNMIRRORED_ORDER, "5550001", Environment.PRODUCTION
+    )
+    assert command == (
+        "shopify-erpnext-connector --env production"
+        " problems show unmirrored_order:5550001"
     )
 
 
 def test_show_command_quotes_a_subject_the_shell_would_split() -> None:
-    assert show_command(ProblemKind.AMBIGUOUS_SKU, "SKU WITH SPACE") == (
-        "shopify-erpnext-connector problems show 'ambiguous_sku:SKU WITH SPACE'"
+    command = show_command(
+        ProblemKind.AMBIGUOUS_SKU, "SKU WITH SPACE", Environment.STAGING
+    )
+    assert command == (
+        "shopify-erpnext-connector --env staging"
+        " problems show 'ambiguous_sku:SKU WITH SPACE'"
     )
 
 

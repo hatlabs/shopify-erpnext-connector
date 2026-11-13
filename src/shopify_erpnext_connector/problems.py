@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
+from shopify_erpnext_connector.config import Environment
 from shopify_erpnext_connector.store import transaction, utc_timestamp
 
 CLI_NAME = "shopify-erpnext-connector"
@@ -83,8 +84,14 @@ def parse_problem_key(key: str) -> tuple[ProblemKind, str] | None:
     return (parsed, subject) if subject else None
 
 
-def show_command(kind: ProblemKind, subject: str) -> str:
-    return f"{CLI_NAME} problems show {shlex.quote(problem_key(kind, subject))}"
+def show_command(kind: ProblemKind, subject: str, environment: Environment) -> str:
+    """The CLI command showing the problem, asking this environment's connector.
+
+    Without `--env` the CLI asks whichever connector the operator's shell
+    selects, which answers truthfully that it has no such problem.
+    """
+    key = shlex.quote(problem_key(kind, subject))
+    return f"{CLI_NAME} --env {environment} problems show {key}"
 
 
 def record_check(

@@ -29,7 +29,10 @@ from shopify_erpnext_connector.store import open_store
 NOW = datetime(2026, 11, 12, 10, 0, tzinfo=UTC)
 VARIANT = "gid://shopify/ProductVariant/1001"
 OTHER_VARIANT = "gid://shopify/ProductVariant/1002"
-SHOW_COMMAND = f"shopify-erpnext-connector problems show unbound_sku:{VARIANT}"
+# run_pass sends from production by default.
+SHOW_COMMAND = (
+    f"shopify-erpnext-connector --env production problems show unbound_sku:{VARIANT}"
+)
 ONE_SECOND = timedelta(seconds=1)
 COMMUNICATION_PATH = "/api/resource/Communication"
 
