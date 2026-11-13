@@ -60,7 +60,7 @@ from shopify_erpnext_connector.problems import (
     problem_key,
 )
 from shopify_erpnext_connector.push import recent_pushes, unpushed_since
-from shopify_erpnext_connector.store import dry_run, utc_timestamp
+from shopify_erpnext_connector.store import dry_run, set_dry_run, utc_timestamp
 from shopify_erpnext_connector.worker import BINDING_PROBLEM_KINDS, SKU_DETAIL
 
 ENVIRONMENT_HEADER = "X-Connector-Environment"
@@ -82,6 +82,9 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 WRITER_LOCK_TIMEOUT_SECONDS = 30.0
 # Request bodies hold a few identifiers; anything larger is refused unread.
 MAX_BODY_BYTES = 64 * 1024
+
+# Audit log action names; stable, so the log can be searched by them.
+DRY_RUN_ACTION = "dry-run"
 
 _BEARER_SCHEME = "bearer"
 
@@ -389,6 +392,32 @@ class ApiServer:
         rows = comparison_report(request.connection)
         return self.json(HTTPStatus.OK, {"rows": [asdict(row) for row in rows]})
 
+    def set_dry_run(self, request: _Request) -> _Response:
+        on = request.body.get("on")
+        if not isinstance(on, bool):
+            return self.error(
+                HTTPStatus.BAD_REQUEST, "the body needs 'on' as true or false"
+            )
+        connection = request.connection
+        was = dry_run(connection)
+        if on != was:
+            set_dry_run(connection, on)
+            self.audit_mutation(request, DRY_RUN_ACTION, {"old": was, "new": on})
+        return self.json(HTTPStatus.OK, {"dry_run": on, "changed": on != was})
+
+    def audit_mutation(
+        self, request: _Request, action: str, detail: Mapping[str, object]
+    ) -> None:
+        # Operator routes reach a handler only with an operator's token.
+        assert request.operator is not None
+        audit(
+            request.connection,
+            request.operator,
+            action,
+            json.dumps(detail),
+            self._clock(),
+        )
+
     def metrics(self, request: _Request) -> _Response:
         connection = request.connection
         now = self._clock()
@@ -469,6 +498,7 @@ _ROUTES: Mapping[str, _Route] = {
     "/bindings": _Route("GET", _Access.OPERATOR, ApiServer.bindings),
     "/record": _Route("GET", _Access.OPERATOR, ApiServer.record),
     "/report": _Route("GET", _Access.OPERATOR, ApiServer.report),
+    "/dry-run": _Route("POST", _Access.OPERATOR, ApiServer.set_dry_run),
 }
 
 

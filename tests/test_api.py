@@ -1121,17 +1121,21 @@ def test_a_bad_content_length_is_a_bad_request(
     assert probe == []
 
 
+MUTATIONS = {"/dry-run": {"on": False}}
+
+
+@pytest.mark.parametrize("path", MUTATIONS)
 def test_a_mutation_takes_an_operator_token_for_this_environment(
-    client: httpx.Client, worker: FakeWorker, probe: list[object]
+    client: httpx.Client, store: sqlite3.Connection, path: str
 ) -> None:
     def status(headers: dict[str, str]) -> int:
-        return client.post("/probe", json={}, headers=headers).status_code
+        return client.post(path, json=MUTATIONS[path], headers=headers).status_code
 
     assert status({}) == 401
     assert status(operator(METRICS_TOKEN)) == 401
     assert status(operator(environment=Environment.PRODUCTION)) == 409
     assert status(bearer(ALICE_TOKEN)) == 409
-    assert probe == []
+    assert audit_rows(store) == []
 
 
 def test_a_mutation_endpoint_refuses_get(
@@ -1141,3 +1145,55 @@ def test_a_mutation_endpoint_refuses_get(
 
     assert response.status_code == 405
     assert response.headers["allow"] == "POST"
+
+
+def test_turning_dry_run_off_is_audited_with_the_operators_name(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    response = client.post("/dry-run", json={"on": False}, headers=operator())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "environment": "staging",
+        "dry_run": False,
+        "changed": True,
+    }
+    assert audit_rows(store) == [("alice", "dry-run", {"old": True, "new": False})]
+    assert client.get("/status", headers=operator()).json()["dry_run"] is False
+
+
+def test_turning_dry_run_back_on_is_audited(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    set_dry_run(store, False)
+
+    response = client.post("/dry-run", json={"on": True}, headers=operator(BOB_TOKEN))
+
+    assert response.json()["dry_run"] is True
+    assert audit_rows(store) == [("bob", "dry-run", {"old": False, "new": True})]
+
+
+def test_setting_dry_run_to_its_state_changes_and_audits_nothing(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    response = client.post("/dry-run", json={"on": True}, headers=operator())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "environment": "staging",
+        "dry_run": True,
+        "changed": False,
+    }
+    assert audit_rows(store) == []
+
+
+@pytest.mark.parametrize("body", [{}, {"on": "off"}, {"on": 0}, {"on": None}])
+def test_dry_run_needs_a_boolean(
+    client: httpx.Client, store: sqlite3.Connection, body: dict[str, object]
+) -> None:
+    response = client.post("/dry-run", json=body, headers=operator())
+
+    assert response.status_code == 400
+    assert response.json()["environment"] == "staging"
+    assert "on" in response.json()["error"]
+    assert audit_rows(store) == []
