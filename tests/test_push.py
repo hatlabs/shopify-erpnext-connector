@@ -8,6 +8,7 @@ import httpx
 import pytest
 from helpers import LOCATION_ID, SHOP_DOMAIN, make_config
 
+from shopify_erpnext_connector.poller import mark_dirty
 from shopify_erpnext_connector.problems import Problem, ProblemKind
 from shopify_erpnext_connector.push import (
     LEVELS_PAGE_SIZE,
@@ -774,17 +775,19 @@ def fail_pushes(store: sqlite3.Connection, targets: list[PushTarget]) -> None:
     push(store, down.client(), LOCATION_ID, targets, NOW)
 
 
-def stale(
-    store: sqlite3.Connection,
-    now: datetime = NOW + THRESHOLD,
-    waiting_since: Mapping[str, str] | None = None,
-) -> Problem | None:
-    return stale_pushes(
-        store,
-        now,
-        THRESHOLD,
-        location_id=LOCATION_ID,
-        waiting_since=waiting_since or {},
+def stale(store: sqlite3.Connection, now: datetime = NOW + THRESHOLD) -> Problem | None:
+    return stale_pushes(store, now, THRESHOLD, location_id=LOCATION_ID)
+
+
+def item_code(n: int) -> str:
+    return f"TEST-ITEM-{n:03d}"
+
+
+def bind(store: sqlite3.Connection, n: int) -> None:
+    store.execute(
+        "INSERT INTO bindings (variant_id, inventory_item_id, item_code, bound_at)"
+        " VALUES (?, ?, ?, ?)",
+        (variant_id(n), inventory_item_id(n), item_code(n), utc_timestamp(NOW)),
     )
 
 
@@ -853,21 +856,33 @@ def test_pushed_variant_is_no_longer_a_stale_push(store: sqlite3.Connection) -> 
 def test_variant_waiting_past_the_threshold_without_a_pending_value_is_stale(
     store: sqlite3.Connection,
 ) -> None:
-    waiting = {variant_id(1): utc_timestamp(NOW), variant_id(2): utc_timestamp(LATER)}
+    bind(store, 1)
+    bind(store, 2)
+    mark_dirty(store, [item_code(1)], NOW)
+    mark_dirty(store, [item_code(2)], LATER)
 
-    problem = stale(store, waiting_since=waiting)
+    problem = stale(store)
 
     assert problem is not None
     assert problem.context["Variants"] == variant_id(1)
+
+
+def test_dirty_item_that_is_not_bound_is_no_stale_push(
+    store: sqlite3.Connection,
+) -> None:
+    mark_dirty(store, [item_code(1)], NOW)
+
+    assert stale(store) is None
 
 
 def test_variant_both_waiting_and_pending_counts_once_since_the_earlier(
     store: sqlite3.Connection,
 ) -> None:
     fail_pushes(store, [target(1, 5, 1)])
-    earlier = NOW - timedelta(minutes=10)
+    bind(store, 1)
+    mark_dirty(store, [item_code(1)], NOW - timedelta(minutes=10))
 
-    problem = stale(store, waiting_since={variant_id(1): utc_timestamp(earlier)})
+    problem = stale(store)
 
     assert problem is not None
     assert problem.context["Unpushed variants"] == "1"

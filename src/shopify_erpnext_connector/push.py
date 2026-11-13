@@ -24,7 +24,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
+from shopify_erpnext_connector.bindings import load_bindings
 from shopify_erpnext_connector.numeric import is_integer
+from shopify_erpnext_connector.poller import dirty_items
 from shopify_erpnext_connector.problems import Problem, ProblemKind
 from shopify_erpnext_connector.shopify import (
     CHANGE_FROM_QUANTITY_STALE,
@@ -409,17 +411,14 @@ def stale_pushes(
     threshold: timedelta,
     *,
     location_id: str,
-    waiting_since: Mapping[str, str],
 ) -> Problem | None:
     """One problem for the location while any variant has gone unpushed too long.
-
-    `waiting_since` is as for `unpushed_since`.
 
     One problem rather than one per variant, so an outage emails once. The
     variants and times go in the context, which is not fingerprinted: they
     change as the outage goes on, and each change would email it again.
     """
-    since = unpushed_since(connection, waiting_since)
+    since = unpushed_since(connection)
     cutoff = utc_timestamp(now - threshold)
     # Stored timestamps are fixed-width UTC, so they order as strings.
     stale = {v: stamp for v, stamp in since.items() if stamp <= cutoff}
@@ -438,19 +437,25 @@ def stale_pushes(
     )
 
 
-def unpushed_since(
-    connection: sqlite3.Connection, waiting_since: Mapping[str, str]
-) -> dict[str, str]:
+def unpushed_since(connection: sqlite3.Connection) -> dict[str, str]:
     """Since when each variant has waited for a push, by variant ID.
 
-    `waiting_since` holds, by variant ID, stored timestamps from when a
-    variant started waiting for a value not yet computed, such as when its
-    item was marked dirty: a pass that fails before pushing queues nothing.
-    A variant counts once, unpushed since the earlier of that time and the
-    time its pending value was queued.
+    A bound variant waits from when its item was marked dirty, since a pass
+    that fails before pushing queues nothing, and from when its pending value
+    was queued. It counts once, unpushed since the earlier of the two.
     """
-    since = dict(waiting_since)
+    since = _dirty_since(connection)
     rows = connection.execute("SELECT variant_id, queued_at FROM pending_pushes")
     for variant_id, queued_at in rows:
         since[variant_id] = min(queued_at, since.get(variant_id, queued_at))
     return since
+
+
+def _dirty_since(connection: sqlite3.Connection) -> dict[str, str]:
+    """When each bound variant's item was marked dirty, by variant ID."""
+    dirty = dirty_items(connection)
+    return {
+        b.variant_id: dirty[b.item_code].marked_at
+        for b in load_bindings(connection)
+        if b.item_code in dirty
+    }

@@ -38,7 +38,6 @@ from shopify_erpnext_connector.config import Config
 from shopify_erpnext_connector.problems import count_open_problems, count_unsent_emails
 from shopify_erpnext_connector.push import unpushed_since
 from shopify_erpnext_connector.store import dry_run, utc_timestamp
-from shopify_erpnext_connector.worker import dirty_since
 
 ENVIRONMENT_HEADER = "X-Connector-Environment"
 JSON_CONTENT_TYPE = "application/json"
@@ -291,7 +290,7 @@ class ApiServer:
 
     def _push_lag(self, connection: sqlite3.Connection) -> float:
         """Seconds the oldest value not yet pushed has waited; 0 if none waits."""
-        since = unpushed_since(connection, dirty_since(connection))
+        since = unpushed_since(connection)
         if not since:
             return 0
         oldest = datetime.fromisoformat(min(since.values()))
