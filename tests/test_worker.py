@@ -1638,8 +1638,7 @@ OPERATOR_TOKEN = "test-operator-token"
 AUTH_HEADER = "Authorization"
 
 
-def accept_sku_change(world: World, n: int, sku: str) -> httpx.Response:
-    """Accept SKU `sku` for variant `n` through the API, as the CLI does."""
+def api_server(world: World) -> ApiServer:
     config = replace(
         world.config,
         store_path=world.path,
@@ -1648,16 +1647,33 @@ def accept_sku_change(world: World, n: int, sku: str) -> httpx.Response:
             world.config.secrets, operator_tokens={"alice": Secret(OPERATOR_TOKEN)}
         ),
     )
-    server = ApiServer(config, world.worker)
+    return ApiServer(config, world.worker, pass_wait_timeout=WAIT_SECONDS)
+
+
+def post(
+    server: ApiServer, world: World, path: str, body: dict[str, object]
+) -> httpx.Response:
+    return httpx.post(
+        f"http://127.0.0.1:{server.port}{path}",
+        json=body,
+        headers={
+            AUTH_HEADER: f"Bearer {OPERATOR_TOKEN}",
+            ENVIRONMENT_HEADER: world.config.environment,
+        },
+        timeout=2 * WAIT_SECONDS,
+    )
+
+
+def accept_sku_change(world: World, n: int, sku: str) -> httpx.Response:
+    """Accept SKU `sku` for variant `n` through the API, as the CLI does."""
+    server = api_server(world)
     server.start()
     try:
-        return httpx.post(
-            f"http://127.0.0.1:{server.port}/bindings/accept-sku-change",
-            json={"variant": variant_id(n), "sku": sku},
-            headers={
-                AUTH_HEADER: f"Bearer {OPERATOR_TOKEN}",
-                ENVIRONMENT_HEADER: world.config.environment,
-            },
+        return post(
+            server,
+            world,
+            "/bindings/accept-sku-change",
+            {"variant": variant_id(n), "sku": sku},
         )
     finally:
         server.close()
@@ -1764,3 +1780,39 @@ def test_an_accepted_sku_with_no_item_stays_held_until_its_item_exists(
     assert bound_item_code(world.store, variant_id(9)) == item_code(10)
     assert world.open_of(ProblemKind.CHANGED_SKU) == []
     assert world.shopify.available(9) == 2
+
+
+def test_push_and_rerun_wait_for_the_running_loops_pass(world: World) -> None:
+    worker = sleep_long(world)
+    world.bind(1, actual=3, available=0)
+    world.shopify.add_variant(2, item_code(2))
+    worker.run_pass(NOW)
+    assert world.open_of(ProblemKind.UNBOUND_SKU) == [variant_id(2)]
+    # Edited by hand: no Bin changed, so only the push marks the item.
+    world.shopify.set_available(1, 7)
+    world.erpnext.add_item(item_code(2))
+    world.erpnext.set_bin(item_code(2), actual=4)
+    server = api_server(world)
+    answers: dict[str, httpx.Response] = {}
+
+    def operator() -> None:
+        answers["push"] = post(server, world, "/push", {"variant": variant_id(1)})
+        key = f"{ProblemKind.UNBOUND_SKU}:{variant_id(2)}"
+        answers["rerun"] = post(server, world, "/rerun", {"key": key})
+
+    server.start()
+    try:
+        run_alongside(worker, operator)
+    finally:
+        server.close()
+
+    pushed = answers["push"].json()
+    assert pushed["pass"] == PassResult.COMPLETED
+    assert pushed["dry_run"] is False
+    assert pushed["decision"]["action"] == "pushed"
+    assert (pushed["push"]["available"], pushed["push"]["change_from"]) == (3, 7)
+    assert world.shopify.available(1) == 3
+    rerun = answers["rerun"].json()
+    assert rerun["pass"] == PassResult.COMPLETED
+    assert rerun["problem"]["resolved_at"] is not None
+    assert world.shopify.available(2) == 4

@@ -80,7 +80,7 @@ def poll_bins(
         stamps.append(current)
     latest = max(stamps, default=None)
     with transaction(connection):
-        _insert_dirty(connection, changed, now)
+        insert_dirty(connection, changed, now)
         if latest is not None and latest != current:
             connection.execute(
                 "INSERT INTO watermark (id, bin_modified) VALUES (1, ?)"
@@ -99,7 +99,7 @@ def mark_dirty(
 ) -> None:
     """Mark items dirty; an item already dirty keeps its time and attempts."""
     with transaction(connection):
-        _insert_dirty(connection, item_codes, now)
+        insert_dirty(connection, item_codes, now)
 
 
 def clear_dirty(connection: sqlite3.Connection, item_codes: Collection[str]) -> None:
@@ -127,9 +127,10 @@ def dirty_items(connection: sqlite3.Connection) -> dict[str, DirtyItem]:
     return {code: DirtyItem(marked_at, attempts) for code, marked_at, attempts in rows}
 
 
-def _insert_dirty(
+def insert_dirty(
     connection: sqlite3.Connection, item_codes: Collection[str], now: datetime
 ) -> None:
+    """`mark_dirty` inside the caller's transaction."""
     stamp = utc_timestamp(now)
     connection.executemany(
         "INSERT INTO dirty_items (item_code, marked_at) VALUES (?, ?)"
