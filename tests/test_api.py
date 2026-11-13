@@ -870,6 +870,23 @@ def test_record_for_a_variant_with_only_a_resolved_problem_is_not_found(
     assert get_record(client, VARIANT).status_code == 404
 
 
+def test_record_for_a_held_variant_whose_problem_resolved_shows_the_hold(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+    record_check(store, ProblemKind.CHANGED_SKU, [], NOW)
+
+    response = get_record(client, VARIANT)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["binding_problem"] is None
+    assert body["sku_change"] == {
+        "bound_item_code": "TEST-ITEM-001",
+        "detected_at": utc_timestamp(NOW),
+    }
+
+
 def test_record_ignores_problems_other_than_binding(
     client: httpx.Client, store: sqlite3.Connection
 ) -> None:

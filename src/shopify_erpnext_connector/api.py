@@ -34,7 +34,11 @@ from socketserver import BaseServer
 from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
 
-from shopify_erpnext_connector.bindings import bound_item_code, load_sku_changes
+from shopify_erpnext_connector.bindings import (
+    bound_item_code,
+    load_sku_change,
+    load_sku_changes,
+)
 from shopify_erpnext_connector.config import Config
 from shopify_erpnext_connector.decisions import (
     comparison_report,
@@ -312,7 +316,8 @@ class ApiServer:
         )
         decision = load_dated_decision(connection, variant_id)
         history = recent_pushes(connection, variant_id, RECORD_PUSH_HISTORY)
-        known = item_code or binding_problem or decision or history
+        sku_change = load_sku_change(connection, variant_id)
+        known = item_code or binding_problem or decision or history or sku_change
         if not known:
             return self.error(
                 HTTPStatus.NOT_FOUND, f"no record of variant {variant_id}"
@@ -329,6 +334,14 @@ class ApiServer:
                     None
                     if decision is None
                     else asdict(decision.decision) | {"decided_at": decision.decided_at}
+                ),
+                "sku_change": (
+                    None
+                    if sku_change is None
+                    else {
+                        "bound_item_code": sku_change.bound_item_code,
+                        "detected_at": sku_change.detected_at,
+                    }
                 ),
                 "push_history": [asdict(attempt) for attempt in history],
             },

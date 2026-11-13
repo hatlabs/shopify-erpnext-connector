@@ -293,6 +293,17 @@ def load_sku_changes(connection: sqlite3.Connection) -> list[SkuChange]:
     return [SkuChange(*row) for row in rows]
 
 
+def load_sku_change(
+    connection: sqlite3.Connection, variant_id: str
+) -> SkuChange | None:
+    row = connection.execute(
+        "SELECT variant_id, bound_item_code, detected_at FROM sku_changes"
+        " WHERE variant_id = ?",
+        (variant_id,),
+    ).fetchone()
+    return None if row is None else SkuChange(*row)
+
+
 def save_bindings(
     connection: sqlite3.Connection, result: BindingResult, now: datetime
 ) -> None:
