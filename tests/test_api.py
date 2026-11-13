@@ -1,19 +1,22 @@
+import json
 import logging
 import socket
 import sqlite3
+import threading
 from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
 
 import httpx
 import pytest
-from helpers import make_config
+from helpers import FakeWorker, make_config
 
 from shopify_erpnext_connector import api
 from shopify_erpnext_connector.api import (
     ENVIRONMENT_HEADER,
+    MAX_BODY_BYTES,
     METRICS_CONTENT_TYPE,
     PASS_STALE_AFTER,
     RECORD_PUSH_HISTORY,
@@ -30,19 +33,13 @@ from shopify_erpnext_connector.store import open_store, set_dry_run, utc_timesta
 NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
 ALICE_TOKEN = "test-alice-token"
 REQUEST_TIMEOUT_SECONDS = 0.5
+WRITER_LOCK_TIMEOUT_SECONDS = 0.5
 BOB_TOKEN = "test-bob-token"
 METRICS_TOKEN = "test-metrics-token"
 # Kept apart from its value so the fixture check's header pattern stays meaningful.
 AUTH_HEADER = "Authorization"
 VARIANT = "gid://shopify/ProductVariant/1001"
 OTHER_VARIANT = "gid://shopify/ProductVariant/1002"
-
-
-@dataclass
-class FakeWorker:
-    last_pass_at: datetime | None = None
-    last_pass_full: bool = False
-    last_full_pass_at: datetime | None = None
 
 
 class Clock:
@@ -91,7 +88,11 @@ def server(store_path: Path, worker: FakeWorker, clock: Clock) -> Iterator[ApiSe
         ),
     )
     server = ApiServer(
-        config, worker, clock=clock, request_timeout=REQUEST_TIMEOUT_SECONDS
+        config,
+        worker,
+        clock=clock,
+        request_timeout=REQUEST_TIMEOUT_SECONDS,
+        writer_lock_timeout=WRITER_LOCK_TIMEOUT_SECONDS,
     )
     server.start()
     yield server
@@ -964,3 +965,179 @@ def test_record_without_a_variant_is_a_bad_request(client: httpx.Client) -> None
 
     assert response.status_code == 400
     assert "variant" in response.json()["error"]
+
+
+# The write path
+
+
+def audit_rows(store: sqlite3.Connection) -> list[tuple[str, str, object]]:
+    rows = store.execute("SELECT operator, action, detail FROM audit_log").fetchall()
+    return [
+        (operator, action, None if detail is None else json.loads(detail))
+        for operator, action, detail in rows
+    ]
+
+
+@pytest.fixture
+def probe(monkeypatch: pytest.MonkeyPatch, worker: FakeWorker) -> list[object]:
+    """A POST route at /probe that audits its body; returns the bodies it saw.
+
+    It answers 404 after writing when the body asks it to fail, to show that
+    a refused mutation leaves nothing behind.
+    """
+    seen: list[object] = []
+
+    def handle(server: ApiServer, request: api._Request) -> api._Response:
+        seen.append(dict(request.body))
+        assert worker.writer_lock.locked()
+        assert request.operator is not None
+        audit(request.connection, request.operator, "probe", json.dumps({}), NOW)
+        if request.body.get("fail"):
+            return server.error(HTTPStatus.NOT_FOUND, "probe refused")
+        if request.body.get("raise"):
+            raise RuntimeError("probe failed")
+        return server.json(HTTPStatus.OK, {"done": True})
+
+    monkeypatch.setitem(
+        api._ROUTES, "/probe", api._Route("POST", api._Access.OPERATOR, handle)
+    )
+    return seen
+
+
+def test_a_mutation_runs_under_the_writer_lock_and_commits(
+    client: httpx.Client, store: sqlite3.Connection, probe: list[object]
+) -> None:
+    response = client.post("/probe", json={"x": 1}, headers=operator(BOB_TOKEN))
+
+    assert response.status_code == 200
+    assert response.json() == {"environment": "staging", "done": True}
+    assert probe == [{"x": 1}]
+    assert audit_rows(store) == [("bob", "probe", {})]
+
+
+def test_a_refused_mutation_writes_nothing(
+    client: httpx.Client, store: sqlite3.Connection, probe: list[object]
+) -> None:
+    response = client.post("/probe", json={"fail": True}, headers=operator())
+
+    assert response.status_code == 404
+    assert audit_rows(store) == []
+
+
+def test_a_failed_mutation_writes_nothing_and_releases_the_lock(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    probe: list[object],
+) -> None:
+    response = client.post("/probe", json={"raise": True}, headers=operator())
+
+    assert response.status_code == 500
+    assert response.json()["environment"] == "staging"
+    assert audit_rows(store) == []
+    assert not worker.writer_lock.locked()
+
+
+def test_a_mutation_while_a_pass_holds_the_lock_is_refused(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    probe: list[object],
+) -> None:
+    with worker.writer_lock:
+        response = client.post("/probe", json={}, headers=operator())
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["environment"] == "staging"
+    assert "pass" in body["error"]
+    assert "retry" in body["error"]
+    assert probe == []
+    assert audit_rows(store) == []
+
+
+def test_a_mutation_waits_for_a_pass_that_ends_within_the_bound(
+    client: httpx.Client, worker: FakeWorker, probe: list[object]
+) -> None:
+    worker.writer_lock.acquire()
+    wait = WRITER_LOCK_TIMEOUT_SECONDS / 10
+    release = threading.Timer(wait, worker.writer_lock.release)
+    release.start()
+    try:
+        response = client.post("/probe", json={}, headers=operator())
+    finally:
+        release.join()
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        (b"{not json", "JSON"),
+        (b"\xff\xfe", "JSON"),
+        (b"[1, 2]", "object"),
+        (b"", "object"),
+    ],
+)
+def test_a_body_that_is_not_a_json_object_is_a_bad_request(
+    client: httpx.Client, probe: list[object], content: bytes, reason: str
+) -> None:
+    response = client.post("/probe", content=content, headers=operator())
+
+    assert response.status_code == 400
+    assert response.json()["environment"] == "staging"
+    assert reason in response.json()["error"]
+    assert probe == []
+
+
+def test_a_body_past_the_limit_is_refused(
+    client: httpx.Client, probe: list[object]
+) -> None:
+    content = b" " * (MAX_BODY_BYTES + 1)
+
+    response = client.post("/probe", content=content, headers=operator())
+
+    assert response.status_code == 413
+    assert response.json()["environment"] == "staging"
+    assert probe == []
+
+
+@pytest.mark.parametrize("length", ["many", "-1"])
+def test_a_bad_content_length_is_a_bad_request(
+    server: ApiServer, probe: list[object], length: str
+) -> None:
+    request = (
+        "POST /probe HTTP/1.1\r\n"
+        f"{AUTH_HEADER}: Bearer {ALICE_TOKEN}\r\n"
+        f"{ENVIRONMENT_HEADER}: staging\r\n"
+        f"Content-Length: {length}\r\n\r\n"
+    )
+    with socket.create_connection(("127.0.0.1", server.port), timeout=5) as raw:
+        raw.sendall(request.encode())
+        answer = raw.recv(4096)
+
+    assert answer.startswith(b"HTTP/1.0 400")
+    assert probe == []
+
+
+def test_a_mutation_takes_an_operator_token_for_this_environment(
+    client: httpx.Client, worker: FakeWorker, probe: list[object]
+) -> None:
+    def status(headers: dict[str, str]) -> int:
+        return client.post("/probe", json={}, headers=headers).status_code
+
+    assert status({}) == 401
+    assert status(operator(METRICS_TOKEN)) == 401
+    assert status(operator(environment=Environment.PRODUCTION)) == 409
+    assert status(bearer(ALICE_TOKEN)) == 409
+    assert probe == []
+
+
+def test_a_mutation_endpoint_refuses_get(
+    client: httpx.Client, probe: list[object]
+) -> None:
+    response = client.get("/probe", headers=operator())
+
+    assert response.status_code == 405
+    assert response.headers["allow"] == "POST"

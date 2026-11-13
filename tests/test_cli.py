@@ -12,7 +12,7 @@ from importlib.metadata import entry_points
 from pathlib import Path
 
 import pytest
-from helpers import make_config
+from helpers import FakeWorker, make_config
 
 from shopify_erpnext_connector import cli
 from shopify_erpnext_connector.api import ENVIRONMENT_HEADER, ApiServer
@@ -50,13 +50,6 @@ STATUS = {
     "open_problems": 0,
     "unsent_emails": 0,
 }
-
-
-@dataclass
-class FakeWorker:
-    last_pass_at: None = None
-    last_pass_full: bool = False
-    last_full_pass_at: None = None
 
 
 @dataclass
