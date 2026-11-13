@@ -28,14 +28,21 @@ passes in between work from the stored bindings. Until a full pass has
 succeeded in this process those passes only poll Bins: the stored bindings
 may predate SKU changes made while the connector was down. The waits are
 kept in memory only: the full pass after a restart retries everything anyway.
+
+An operator command can ask for a pass with `request_pass` and wait for it
+with `wait_for_pass`. The request wakes the loop from its sleep, and the items
+it names, and a requested full pass, skip their retry waits: the operator
+asked for this attempt.
 """
 
 import logging
 import sqlite3
 import threading
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
 from shopify_erpnext_connector.availability import (
     Sellable,
@@ -93,6 +100,8 @@ SALE_SETTLE_HOLD = timedelta(seconds=60)
 # How often problem emails are sent and their delivery checked: each check
 # reads the status of every undelivered email.
 EMAIL_CHECK_INTERVAL = timedelta(minutes=1)
+# How often the sleep between passes checks `stop`, which ends the loop.
+STOP_CHECK_SECONDS = 0.1
 
 DRY_RUN_ACTION = "dry run"
 MISSING_ACTION = "inventory item not found"
@@ -145,6 +154,18 @@ _log = logging.getLogger(__name__)
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+class PassResult(StrEnum):
+    """How a waited-for pass went.
+
+    A pass ends early when an ERPNext or Shopify error stops it, or when it only polls
+    Bins because no full pass has succeeded yet.
+    """
+
+    COMPLETED = "completed"
+    ENDED_EARLY = "ended early"
+    NOT_FINISHED = "not finished"
 
 
 @dataclass(frozen=True)
@@ -220,6 +241,12 @@ class Worker:
         self._computing: list[str] = []
         self._held_since: dict[str, datetime] = {}
         self._last_email_check_at: datetime | None = None
+        # Guards the pass counters and the wake flag below.
+        self._passes = threading.Condition()
+        self._passes_started = 0
+        self._passes_finished = 0
+        self._last_pass_result = PassResult.NOT_FINISHED
+        self._wake = False
 
     @property
     def last_pass_at(self) -> datetime | None:
@@ -235,66 +262,116 @@ class Worker:
         """When the last full pass that completed started; None before the first."""
         return self._last_full_pass_at
 
-    def request_full_pass(self) -> None:
-        """Make the next pass a full one; call with `writer_lock` held."""
-        self._full_pass_requested = True
+    def request_pass(self, *, full: bool = False, items: Collection[str] = ()) -> int:
+        """Ask for a pass to start now; return its ticket for `wait_for_pass`.
+
+        Call with `writer_lock` held. `full` makes it a full pass; `items` are
+        computed in it even while they wait to be retried.
+        """
+        if full:
+            self._full_pass_requested = True
+            self._full_pass_backoff = None
+        self._forget_backoff(list(items))
+        with self._passes:
+            self._wake = True
+            self._passes.notify_all()
+            return self._passes_started + 1
+
+    def wait_for_pass(self, ticket: int, timeout: float) -> PassResult:
+        """Wait up to `timeout` seconds for the ticket's pass to end.
+
+        Once it has, the result is that of the newest pass to end, which
+        also started after the request.
+        """
+        with self._passes:
+            if not self._passes.wait_for(
+                lambda: self._passes_finished >= ticket, timeout
+            ):
+                return PassResult.NOT_FINISHED
+            return self._last_pass_result
 
     def run(self, stop: threading.Event) -> None:
         interval = self._config.worker.poll_interval.total_seconds()
         while not stop.is_set():
             self.run_pass(self._clock())
-            stop.wait(interval)
+            self._sleep(interval, stop)
+
+    def _sleep(self, seconds: float, stop: threading.Event) -> None:
+        """Sleep until `seconds` pass, a pass is requested or `stop` is set."""
+        deadline = time.monotonic() + seconds
+        with self._passes:
+            while not self._wake and not stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._passes.wait(min(remaining, STOP_CHECK_SECONDS))
 
     def run_pass(self, now: datetime) -> None:
-        connection = self._connection
         with self.writer_lock:
-            dry = dry_run(connection)
-            if self._dry_run_before and not dry:
-                self._full_pass_requested = True
-            self._dry_run_before = dry
-            full = (
-                self._full_pass_requested
-                or self._last_full_pass_at is None
-                or now - self._last_full_pass_at >= FULL_PASS_INTERVAL
-            ) and (
-                self._full_pass_backoff is None
-                or self._full_pass_backoff.retry_at <= now
-            )
+            with self._passes:
+                self._passes_started += 1
+                self._wake = False
+            result = PassResult.ENDED_EARLY
             try:
-                self._sync(now, full=full, dry=dry)
-            except (ShopifyError, ErpNextError) as error:
-                _log.warning("pass ended early; dirty items wait: %s", error)
-                still_dirty = dirty_items(connection)
-                self._back_off([c for c in self._computing if c in still_dirty], now)
-                if full:
-                    self._full_pass_backoff = self._next_backoff(
-                        self._full_pass_backoff, now
-                    )
-            else:
-                if full:
-                    self._last_full_pass_at = now
-                    self._full_pass_requested = False
-                    self._full_pass_backoff = None
-                if self._last_full_pass_at is not None:
-                    self._last_pass_at = now
-                    self._last_pass_full = full
-            if not dry:
-                found = stale_pushes(
-                    connection,
-                    now,
-                    self._config.worker.push_stale_after,
-                    location_id=self._config.location_id,
+                result = self._run_pass(now)
+            finally:
+                with self._passes:
+                    self._passes_finished += 1
+                    self._last_pass_result = result
+                    self._passes.notify_all()
+
+    def _run_pass(self, now: datetime) -> PassResult:
+        """Run a pass; it completed if it counts as `last_pass_at`."""
+        result = PassResult.ENDED_EARLY
+        connection = self._connection
+        dry = dry_run(connection)
+        if self._dry_run_before and not dry:
+            self._full_pass_requested = True
+        self._dry_run_before = dry
+        full = (
+            self._full_pass_requested
+            or self._last_full_pass_at is None
+            or now - self._last_full_pass_at >= FULL_PASS_INTERVAL
+        ) and (
+            self._full_pass_backoff is None or self._full_pass_backoff.retry_at <= now
+        )
+        try:
+            self._sync(now, full=full, dry=dry)
+        except (ShopifyError, ErpNextError) as error:
+            _log.warning("pass ended early; dirty items wait: %s", error)
+            still_dirty = dirty_items(connection)
+            self._back_off([c for c in self._computing if c in still_dirty], now)
+            if full:
+                self._full_pass_backoff = self._next_backoff(
+                    self._full_pass_backoff, now
                 )
-                record_check(
-                    connection,
-                    ProblemKind.STALE_PUSH,
-                    [] if found is None else [found],
-                    now,
-                )
-            last = self._last_email_check_at
-            if last is None or now - last >= EMAIL_CHECK_INTERVAL:
-                send_pending(connection, self._erpnext, self._config, now)
-                self._last_email_check_at = now
+        else:
+            if full:
+                self._last_full_pass_at = now
+                self._full_pass_requested = False
+                self._full_pass_backoff = None
+            if self._last_full_pass_at is not None:
+                self._last_pass_at = now
+                self._last_pass_full = full
+                result = PassResult.COMPLETED
+        if not dry:
+            found = stale_pushes(
+                connection,
+                now,
+                self._config.worker.push_stale_after,
+                location_id=self._config.location_id,
+            )
+            record_check(
+                connection,
+                ProblemKind.STALE_PUSH,
+                [] if found is None else [found],
+                now,
+            )
+        last = self._last_email_check_at
+        if last is None or now - last >= EMAIL_CHECK_INTERVAL:
+            send_pending(connection, self._erpnext, self._config, now)
+            self._last_email_check_at = now
+        return result
 
     def _sync(self, now: datetime, *, full: bool, dry: bool) -> None:
         connection = self._connection

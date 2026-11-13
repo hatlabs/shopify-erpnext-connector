@@ -11,7 +11,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from helpers import FakeWorker, make_config
+from helpers import FakeWorker, PassRequest, make_config
 
 from shopify_erpnext_connector import api
 from shopify_erpnext_connector.api import (
@@ -1291,7 +1291,7 @@ def test_accepting_a_sku_change_records_the_sku_and_asks_for_a_full_pass(
         (OTHER_VARIANT, None),
     ]
     assert audit_rows(store) == [("bob", "accept-sku-change", accepted)]
-    assert worker.full_passes_requested == 1
+    assert worker.requests == [PassRequest(full=True, items=())]
 
 
 def test_accepting_a_sku_other_than_the_recorded_one_is_a_conflict(
@@ -1309,7 +1309,7 @@ def test_accepting_a_sku_other_than_the_recorded_one_is_a_conflict(
     assert "bindings" in error
     assert audit_rows(store) == []
     assert load_accepted(store) == {}
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []
 
 
 def test_accepting_a_sku_change_while_a_pass_holds_the_lock_is_refused(
@@ -1323,7 +1323,7 @@ def test_accepting_a_sku_change_while_a_pass_holds_the_lock_is_refused(
     assert response.status_code == 503
     assert audit_rows(store) == []
     assert load_accepted(store) == {}
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []
 
 
 def test_a_mutation_outwaits_one_upstream_attempt() -> None:
@@ -1375,7 +1375,7 @@ def test_accepting_a_sku_change_with_no_sku_to_accept_is_a_conflict(
     assert response.json()["environment"] == "staging"
     assert message in response.json()["error"]
     assert audit_rows(store) == []
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []
     assert load_accepted(store) == {}
 
 
@@ -1390,7 +1390,7 @@ def test_accepting_a_sku_change_on_a_variant_without_one_changes_nothing(
     assert response.json()["environment"] == "staging"
     assert VARIANT in response.json()["error"]
     assert audit_rows(store) == []
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []
     assert store.execute("SELECT count(*) FROM sku_changes").fetchone()[0] == 1
 
 
@@ -1420,4 +1420,4 @@ def test_accepting_a_sku_change_needs_a_variant_and_a_sku(
     assert f"'{field}'" in response.json()["error"]
     assert audit_rows(store) == []
     assert load_accepted(store) == {}
-    assert worker.full_passes_requested == 0
+    assert worker.requests == []

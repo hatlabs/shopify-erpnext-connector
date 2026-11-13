@@ -30,7 +30,7 @@ import logging
 import socket
 import sqlite3
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -123,7 +123,9 @@ class WorkerState(Protocol):
     @property
     def writer_lock(self) -> threading.Lock: ...
 
-    def request_full_pass(self) -> None: ...
+    def request_pass(
+        self, *, full: bool = False, items: Collection[str] = ()
+    ) -> int: ...
 
 
 def audit(
@@ -481,7 +483,7 @@ class ApiServer:
             "accepted_sku": sku,
         }
         self.audit_mutation(request, ACCEPT_SKU_CHANGE_ACTION, detail)
-        self._worker.request_full_pass()
+        self._worker.request_pass(full=True)
         return self.json(HTTPStatus.OK, detail)
 
     def audit_mutation(

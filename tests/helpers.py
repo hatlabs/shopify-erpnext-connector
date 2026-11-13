@@ -1,6 +1,7 @@
 """Shared test configuration: placeholder hosts, addresses and secrets."""
 
 import threading
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -61,6 +62,12 @@ def make_config(
     )
 
 
+@dataclass(frozen=True)
+class PassRequest:
+    full: bool
+    items: tuple[str, ...]
+
+
 @dataclass
 class FakeWorker:
     """The worker state the API reads, set by hand."""
@@ -69,7 +76,9 @@ class FakeWorker:
     last_pass_full: bool = False
     last_full_pass_at: datetime | None = None
     writer_lock: threading.Lock = field(default_factory=threading.Lock)
-    full_passes_requested: int = 0
+    requests: list[PassRequest] = field(default_factory=list)
 
-    def request_full_pass(self) -> None:
-        self.full_passes_requested += 1
+    def request_pass(self, *, full: bool = False, items: Collection[str] = ()) -> int:
+        assert self.writer_lock.locked()
+        self.requests.append(PassRequest(full, tuple(items)))
+        return len(self.requests)

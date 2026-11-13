@@ -1,6 +1,7 @@
 import json
 import threading
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,7 @@ from shopify_erpnext_connector.worker import (
     MAX_RETRY_BACKOFF,
     SALE_SETTLE_HOLD,
     SKU_DETAIL,
+    PassResult,
     Worker,
 )
 
@@ -1038,7 +1040,7 @@ def test_a_requested_full_pass_runs_next_and_once(world: World) -> None:
     world.bind(1, actual=3, available=3)
     world.worker.run_pass(NOW)
 
-    world.worker.request_full_pass()
+    request(world.worker, full=True)
     world.worker.run_pass(NOW + SECOND)
     assert (world.shopify.variant_reads, world.worker.last_pass_full) == (2, True)
 
@@ -1410,6 +1412,172 @@ def test_run_passes_until_stopped(world: World) -> None:
     world.worker.run(stop)
 
     assert world.worker.last_pass_at == NOW
+    assert world.shopify.available(1) == 3
+
+
+# Pass requests
+
+# Long enough for a pass run in a thread; a hung test fails after it.
+WAIT_SECONDS = 5.0
+# A sleep between passes that no passing test waits out, short enough that a
+# loop that fails to wake ends the test instead of hanging it.
+LONG_SLEEP = timedelta(seconds=10 * WAIT_SECONDS)
+
+
+def request(worker: Worker, *, full: bool = False, items: Collection[str] = ()) -> int:
+    with worker.writer_lock:
+        return worker.request_pass(full=full, items=items)
+
+
+def sleep_long(world: World) -> Worker:
+    """A new worker whose sleep between passes no test waits out."""
+    world.config = replace(
+        world.config, worker=replace(world.config.worker, poll_interval=LONG_SLEEP)
+    )
+    world.worker = world.new_worker()
+    return world.worker
+
+
+def run_alongside(worker: Worker, client: Callable[[], None]) -> None:
+    """Run the worker's loop until `client`, run in a thread, returns.
+
+    The loop runs in this thread, which made the store connection, as in the
+    service. The client's exception, if any, is raised here.
+    """
+    stop = threading.Event()
+    failures: list[BaseException] = []
+
+    def run_client() -> None:
+        try:
+            client()
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            stop.set()
+
+    thread = threading.Thread(target=run_client)
+    thread.start()
+    worker.run(stop)
+    thread.join(WAIT_SECONDS)
+    assert not thread.is_alive()
+    if failures:
+        raise failures[0]
+
+
+def test_a_request_wakes_the_loop_from_its_sleep(world: World) -> None:
+    worker = sleep_long(world)
+    world.bind(1, actual=3, available=0)
+    first = request(worker)
+    answered: list[PassResult] = []
+
+    def client() -> None:
+        answered.append(worker.wait_for_pass(first, WAIT_SECONDS))
+        world.erpnext.set_bin(item_code(1), actual=5)
+        answered.append(worker.wait_for_pass(request(worker), WAIT_SECONDS))
+
+    run_alongside(worker, client)
+
+    assert answered == [PassResult.COMPLETED, PassResult.COMPLETED]
+    assert world.shopify.available(1) == 5
+
+
+def test_stop_ends_the_loop_during_its_sleep(world: World) -> None:
+    worker = sleep_long(world)
+    first = request(worker)
+    answered: list[PassResult] = []
+    started = time.monotonic()
+
+    run_alongside(
+        worker, lambda: answered.append(worker.wait_for_pass(first, WAIT_SECONDS))
+    )
+
+    assert answered == [PassResult.COMPLETED]
+    assert time.monotonic() - started < WAIT_SECONDS
+
+
+def test_a_pass_running_when_requested_does_not_answer_the_request(
+    world: World,
+) -> None:
+    world.bind(1, actual=3, available=0)
+    tickets: list[int] = []
+    world.shopify.on_mutation = lambda: tickets.append(world.worker.request_pass())
+
+    world.worker.run_pass(NOW)
+    world.shopify.on_mutation = None
+
+    assert world.worker.wait_for_pass(tickets[0], 0) is PassResult.NOT_FINISHED
+    world.worker.run_pass(NOW + SECOND)
+    assert world.worker.wait_for_pass(tickets[0], 0) is PassResult.COMPLETED
+
+
+def test_a_finished_pass_does_not_answer_a_later_request(world: World) -> None:
+    world.worker.run_pass(NOW)
+
+    ticket = request(world.worker)
+
+    assert world.worker.wait_for_pass(ticket, 0) is PassResult.NOT_FINISHED
+
+
+def test_a_pass_that_ends_early_answers_a_request(world: World) -> None:
+    world.erpnext.failing.add("Bin poll")
+    ticket = request(world.worker)
+
+    world.worker.run_pass(NOW)
+
+    assert world.worker.last_pass_at is None
+    assert world.worker.wait_for_pass(ticket, 0) is PassResult.ENDED_EARLY
+
+
+def test_a_pass_before_any_full_pass_succeeded_ends_early(world: World) -> None:
+    world.bind(1, actual=3, available=0)
+    world.erpnext.failing.add("Item")
+    world.worker.run_pass(NOW)
+    world.erpnext.failing.clear()
+    ticket = request(world.worker, items=[item_code(1)])
+
+    world.worker.run_pass(NOW + SECOND)
+
+    assert world.worker.wait_for_pass(ticket, 0) is PassResult.ENDED_EARLY
+    assert world.shopify.available(1) == 0
+
+
+def test_a_wait_reports_the_newest_finished_pass(world: World) -> None:
+    world.erpnext.failing.add("Bin poll")
+    ticket = request(world.worker)
+    world.worker.run_pass(NOW)
+    world.erpnext.failing.clear()
+
+    world.worker.run_pass(NOW + POLL)
+
+    assert world.worker.wait_for_pass(ticket, 0) is PassResult.COMPLETED
+
+
+def test_requested_items_are_retried_without_waiting_out_their_backoff(
+    world: World,
+) -> None:
+    world.bind(1, actual=3, available=0)
+    world.shopify.rejects[inventory_item_id(1)] = REJECTED_CODE
+    world.worker.run_pass(NOW)
+    world.shopify.rejects.clear()
+
+    request(world.worker, items=[item_code(1)])
+    world.worker.run_pass(NOW + SECOND)
+
+    assert world.shopify.available(1) == 3
+
+
+def test_a_requested_full_pass_does_not_wait_out_a_failed_ones_backoff(
+    world: World,
+) -> None:
+    world.bind(1, actual=3, available=0)
+    world.erpnext.failing.add("Item")
+    world.worker.run_pass(NOW)
+    world.erpnext.failing.clear()
+
+    request(world.worker, full=True)
+    world.worker.run_pass(NOW + SECOND)
+
+    assert world.worker.last_pass_full
     assert world.shopify.available(1) == 3
 
 
