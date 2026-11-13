@@ -1258,7 +1258,7 @@ def test_a_command_that_waits_for_a_pass_outwaits_the_connector() -> None:
 @pytest.mark.parametrize(
     ("argv", "answer"),
     [
-        (["push", "--all"], {"items": 1, "still_dirty": 0}),
+        (["push", "--all"], {"item_count": 1, "still_dirty": 0}),
         (["rerun", f"unbound_sku:{VARIANT}"], {"key": f"unbound_sku:{VARIANT}"}),
     ],
 )
@@ -1383,7 +1383,7 @@ def test_push_takes_a_variant_or_all(
         ),
         (
             ["push", "--all"],
-            {"all": True, "items": 2, "still_dirty": 2},
+            {"all": True, "item_count": 2, "still_dirty": 2},
             "The items stay marked for the next pass.",
         ),
         (
@@ -1425,7 +1425,7 @@ def test_a_pass_that_did_not_end_in_time_is_reported_as_pending(
         ),
         (
             ["push", "--all"],
-            {"all": True, "items": 2, "still_dirty": 2},
+            {"all": True, "item_count": 2, "still_dirty": 2},
             "The pass ended early; the pushes may not have happened.",
         ),
         (

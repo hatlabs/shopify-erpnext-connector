@@ -548,7 +548,7 @@ class ApiServer:
                 return self.error(
                     HTTPStatus.CONFLICT, "no variant is bound; there is nothing to push"
                 )
-            detail = {"all": True, "items": len(item_codes)}
+            detail = {"all": True, "item_count": len(item_codes)}
         insert_dirty(connection, item_codes, self._clock())
         self.audit_mutation(request, PUSH_ACTION, detail)
         ticket = self._worker.request_pass(items=item_codes)

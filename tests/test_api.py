@@ -1517,7 +1517,7 @@ def test_pushing_all_marks_every_bound_item_and_counts_those_left(
     assert response.json() == {
         "environment": "staging",
         "all": True,
-        "items": 2,
+        "item_count": 2,
         "still_dirty": 1,
         "dry_run": True,
         "pass": "completed",
@@ -1525,7 +1525,7 @@ def test_pushing_all_marks_every_bound_item_and_counts_those_left(
     assert worker.requests == [
         PassRequest(full=False, items=("TEST-ITEM-001", "TEST-ITEM-002"))
     ]
-    assert audit_rows(store) == [("alice", "push", {"all": True, "items": 2})]
+    assert audit_rows(store) == [("alice", "push", {"all": True, "item_count": 2})]
 
 
 def test_a_push_whose_pass_does_not_end_in_time_is_still_accepted(

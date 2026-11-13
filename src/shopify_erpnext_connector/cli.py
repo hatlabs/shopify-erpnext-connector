@@ -492,9 +492,9 @@ def _render_push(document: JsonObject) -> str:
     lines = [_environment_line(document)]
     variant_id = _optional(document, "variant_id", str)
     if variant_id is None:
-        items = _field(document, "items", int)
+        count = _field(document, "item_count", int)
         lines.append(
-            f"Marked {items} bound item{'' if items == 1 else 's'} for a push."
+            f"Marked {count} bound item{'' if count == 1 else 's'} for a push."
         )
         unfinished = _unfinished(
             document,
