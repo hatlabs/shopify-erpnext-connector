@@ -18,6 +18,7 @@ from helpers import FakeWorker, make_config
 from shopify_erpnext_connector import cli
 from shopify_erpnext_connector.api import (
     ENVIRONMENT_HEADER,
+    PASS_WAIT_TIMEOUT_SECONDS,
     WRITER_LOCK_TIMEOUT_SECONDS,
     ApiServer,
 )
@@ -34,7 +35,12 @@ from shopify_erpnext_connector.problems import (
     show_command,
 )
 from shopify_erpnext_connector.push import PushOutcome
-from shopify_erpnext_connector.store import dry_run, open_store, utc_timestamp
+from shopify_erpnext_connector.store import (
+    dry_run,
+    open_store,
+    set_dry_run,
+    utc_timestamp,
+)
 
 CLI_NAME = "shopify-erpnext-connector"
 NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
@@ -1133,6 +1139,9 @@ def test_a_mutation_posts_its_body_with_the_token_and_environment(
     [
         ["dry-run", "off"],
         ["bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"],
+        ["push", VARIANT],
+        ["push", "--all"],
+        ["rerun", f"unbound_sku:{VARIANT}"],
     ],
 )
 def test_a_mutation_on_production_needs_env_on_the_command_line(
@@ -1238,3 +1247,268 @@ def test_a_mutation_outwaits_the_connectors_wait_for_a_pass(
     assert code == 0, err
     (timeout,) = timeouts
     assert timeout > WRITER_LOCK_TIMEOUT_SECONDS
+
+
+def test_a_command_that_waits_for_a_pass_outwaits_the_connector() -> None:
+    assert cli.WAITING_MUTATION_TIMEOUT_SECONDS > (
+        WRITER_LOCK_TIMEOUT_SECONDS + PASS_WAIT_TIMEOUT_SECONDS
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "answer"),
+    [
+        (["push", "--all"], {"items": 1, "still_dirty": 0}),
+        (["rerun", f"unbound_sku:{VARIANT}"], {"key": f"unbound_sku:{VARIANT}"}),
+    ],
+)
+def test_push_and_rerun_wait_as_long_as_the_connector(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    answer: dict[str, object],
+) -> None:
+    configure(monkeypatch, tmp_path, "http://connector.example.com")
+    timeouts: list[object] = []
+
+    def post(url: str, **kwargs: object) -> httpx.Response:
+        timeouts.append(kwargs["timeout"])
+        document = {"environment": "staging", "pass": "not finished"} | answer
+        return httpx.Response(200, json=document)
+
+    monkeypatch.setattr(httpx, "post", post)
+
+    code, _, err = run(capsys, *argv)
+
+    assert code == 0, err
+    assert timeouts == [cli.WAITING_MUTATION_TIMEOUT_SECONDS]
+
+
+@pytest.mark.usefixtures("connected")
+def test_push_reports_the_decision_and_newest_push(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    set_dry_run(store, False)
+    bind_and_decide(store, VARIANT)
+
+    code, out, err = run(capsys, "push", VARIANT)
+
+    assert code == 0, err
+    lines = out.splitlines()
+    assert lines[:3] == [
+        "Environment: staging",
+        f"Variant: {VARIANT} (item TEST-ITEM-001)",
+        "Last decision: item TEST-ITEM-001, action pushed",
+    ]
+    assert f"  Decided at: {utc_timestamp(NOW)}" in lines
+    assert lines[-1] == f"Newest push: {utc_timestamp(NOW)}  3 (from 2)  pushed"
+    assert "Dry run" not in out
+    assert audit_rows(store) == [("alice", "push")]
+
+
+@pytest.mark.usefixtures("connected")
+def test_push_in_dry_run_says_nothing_was_pushed(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bind_and_decide(store, VARIANT)
+
+    code, out, err = run(capsys, "push", VARIANT)
+
+    assert code == 0, err
+    assert "Dry run is on: computed, nothing pushed." in out.splitlines()
+
+
+@pytest.mark.usefixtures("connected")
+def test_push_all_reports_the_items_marked_and_left(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    set_dry_run(store, False)
+    bind_and_decide(store, VARIANT)
+
+    code, out, err = run(capsys, "push", "--all")
+
+    assert code == 0, err
+    assert out.splitlines() == [
+        "Environment: staging",
+        "Marked 1 bound item for a push.",
+        "After the pass, 1 still waits to be pushed.",
+    ]
+    assert audit_rows(store) == [("alice", "push")]
+
+
+@pytest.mark.usefixtures("connected")
+def test_push_as_json(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bind_and_decide(store, VARIANT)
+
+    code, out, _ = run(capsys, "push", VARIANT, "--json")
+
+    assert code == 0
+    document = json.loads(out)
+    assert document["item_code"] == "TEST-ITEM-001"
+    assert document["pass"] == "completed"
+
+
+@pytest.mark.usefixtures("connected")
+def test_push_of_an_unknown_variant_is_reported(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = run(capsys, "push", VARIANT)
+
+    assert code == cli.EXIT_FAILURE
+    assert out == ""
+    assert "404" in err
+    assert audit_rows(store) == []
+
+
+@pytest.mark.parametrize("argv", [["push"], ["push", VARIANT, "--all"]])
+def test_push_takes_a_variant_or_all(
+    capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit:
+        cli.main(argv)
+
+    assert exit.value.code == USAGE_ERROR
+
+
+@pytest.mark.parametrize(
+    ("argv", "answer", "advice"),
+    [
+        (
+            ["push", VARIANT],
+            {"variant_id": VARIANT, "item_code": "TEST-ITEM-001"},
+            f"Check `record {VARIANT}` later.",
+        ),
+        (
+            ["push", "--all"],
+            {"all": True, "items": 2, "still_dirty": 2},
+            "The items stay marked for the next pass.",
+        ),
+        (
+            ["rerun", f"unbound_sku:{VARIANT}"],
+            {"key": f"unbound_sku:{VARIANT}"},
+            f"Check `problems show unbound_sku:{VARIANT}` later.",
+        ),
+    ],
+)
+def test_a_pass_that_did_not_end_in_time_is_reported_as_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+    argv: list[str],
+    answer: dict[str, object],
+    advice: str,
+) -> None:
+    state, url = canned
+    document = {"environment": "staging", "dry_run": False, "pass": "not finished"}
+    state.answer(200, document | answer)
+    configure(monkeypatch, tmp_path, url)
+
+    code, out, err = run(capsys, *argv)
+
+    assert code == 0, err
+    lines = out.splitlines()
+    assert "did not end within the connector's wait" in lines[-2]
+    assert lines[-1] == advice
+
+
+@pytest.mark.parametrize(
+    ("argv", "answer", "outcome"),
+    [
+        (
+            ["push", VARIANT],
+            {"variant_id": VARIANT, "item_code": "TEST-ITEM-001"},
+            "The pass ended early; the push may not have happened.",
+        ),
+        (
+            ["push", "--all"],
+            {"all": True, "items": 2, "still_dirty": 2},
+            "The pass ended early; the pushes may not have happened.",
+        ),
+        (
+            ["rerun", f"unbound_sku:{VARIANT}"],
+            {"key": f"unbound_sku:{VARIANT}", "problem": {"resolved_at": None}},
+            "The full pass ended early; the problem was not rechecked.",
+        ),
+    ],
+)
+def test_a_pass_that_ended_early_is_reported_as_such(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+    argv: list[str],
+    answer: dict[str, object],
+    outcome: str,
+) -> None:
+    state, url = canned
+    document = {"environment": "staging", "dry_run": False, "pass": "ended early"}
+    state.answer(200, document | answer)
+    configure(monkeypatch, tmp_path, url)
+
+    code, out, err = run(capsys, *argv)
+
+    assert code == 0, err
+    assert out.splitlines()[-2:] == [
+        outcome,
+        "The connector's log and `status` show why.",
+    ]
+    assert "still open" not in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_rerun_reports_a_cleared_problem(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    unbound(store, VARIANT, "TEST-SKU-001")
+    later = NOW + timedelta(minutes=5)
+    record_check(store, ProblemKind.UNBOUND_SKU, [], later)
+
+    code, out, err = run(capsys, "rerun", f"unbound_sku:{VARIANT}")
+
+    assert code == 0, err
+    assert out.splitlines() == [
+        "Environment: staging",
+        f"Problem: unbound_sku:{VARIANT}",
+        f"After a full pass: cleared at {utc_timestamp(later)}",
+    ]
+    assert audit_rows(store) == [("alice", "rerun")]
+
+
+@pytest.mark.usefixtures("connected")
+def test_rerun_reports_a_problem_still_open(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    unbound(store, VARIANT, "TEST-SKU-001")
+
+    code, out, err = run(capsys, "rerun", f"unbound_sku:{VARIANT}")
+
+    assert code == 0, err
+    assert out.splitlines()[-1] == "After a full pass: still open"
+
+
+@pytest.mark.usefixtures("connected")
+def test_rerun_as_json(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    unbound(store, VARIANT, "TEST-SKU-001")
+
+    code, out, _ = run(capsys, "rerun", f"unbound_sku:{VARIANT}", "--json")
+
+    assert code == 0
+    assert json.loads(out)["problem"]["resolved_at"] is None
+
+
+@pytest.mark.usefixtures("connected")
+def test_rerun_of_an_unknown_problem_is_reported(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = run(capsys, "rerun", f"unbound_sku:{VARIANT}")
+
+    assert code == cli.EXIT_FAILURE
+    assert out == ""
+    assert "404" in err
+    assert audit_rows(store) == []
