@@ -24,7 +24,7 @@ The plan lives in the repo's GitHub issues: the parent plan issue and one issue 
 - Secrets are read only from files. Never add an environment-variable fallback for a secret. The set of secret files is defined in one place, `Secrets` in `config.py`.
 - Secret values are `Secret` objects whose `repr` and `str` are redacted. Call `reveal()` only where the value is sent or compared.
 - The HTTP API (`api.py`) never logs headers or tokens. Operator endpoints take only operator tokens and the `X-Connector-Environment` header; `/metrics` takes only the metrics token. Each request opens its own store connection, and the API reads worker state only through `Worker`'s public properties.
-- Mutations are `POST` routes with identifiers in a JSON body. Each runs under `Worker.writer_lock` with a bounded wait and in one store transaction with its audit row; a mutation that changes something writes exactly one audit row (operator name, stable action name, JSON detail). The CLI refuses a mutation against production unless `--env production` is on the command line.
+- Mutations are `POST` routes with identifiers in a JSON body. Each runs in one store transaction with its audit row. A mutation that changes pass inputs or bindings also runs under `Worker.writer_lock` with a bounded wait. `/dry-run` writes only the settings row, which a pass reads once at its start, so it skips the lock and takes effect from the next pass; a mutation that changes something writes exactly one audit row (operator name, stable action name, JSON detail). The CLI refuses a mutation against production unless `--env production` is on the command line.
 
 ## Conventions
 
