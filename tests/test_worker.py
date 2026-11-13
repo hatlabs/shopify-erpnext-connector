@@ -1599,6 +1599,82 @@ def test_a_requested_full_pass_does_not_wait_out_a_failed_ones_backoff(
     assert world.shopify.available(1) == 3
 
 
+def test_requested_work_is_due_to_a_pass_that_read_its_clock_first(
+    world: World,
+) -> None:
+    """The loop reads the clock before it waits for the writer lock, so the
+    pass a request wakes can start with a time earlier than the request's."""
+    world.bind(1, actual=3, available=0)
+    world.erpnext.failing.add("Item")
+    world.worker.run_pass(NOW - 2 * POLL)
+    world.worker.run_pass(NOW - POLL)
+    world.erpnext.failing.clear()
+
+    request(world.worker, full=True)
+    world.worker.run_pass(NOW - SECOND)
+
+    assert world.worker.last_pass_full
+    assert world.shopify.available(1) == 3
+
+
+def test_a_requested_item_is_due_to_a_pass_that_read_its_clock_first(
+    world: World,
+) -> None:
+    world.bind(1, actual=3, available=0)
+    world.shopify.rejects[inventory_item_id(1)] = REJECTED_CODE
+    world.worker.run_pass(NOW - 2 * POLL)
+    world.worker.run_pass(NOW - POLL)
+    world.shopify.rejects.clear()
+
+    request(world.worker, items=[item_code(1)])
+    world.worker.run_pass(NOW - SECOND)
+
+    assert world.shopify.available(1) == 3
+
+
+def test_a_requested_item_that_fails_again_continues_its_backoff(
+    world: World,
+) -> None:
+    world.bind(1, actual=3, available=0)
+    world.shopify.rejects[inventory_item_id(1)] = REJECTED_CODE
+    world.worker.run_pass(NOW)
+    world.worker.run_pass(NOW + POLL)
+    request(world.worker, items=[item_code(1)])
+    third = NOW + POLL + SECOND
+    world.worker.run_pass(third)
+    assert len(world.shopify.mutations) == 3
+
+    world.worker.run_pass(third + 4 * POLL - SECOND)
+
+    assert len(world.shopify.mutations) == 3
+
+    world.worker.run_pass(third + 4 * POLL)
+
+    assert len(world.shopify.mutations) == 4
+
+
+def test_a_requested_full_pass_that_fails_again_continues_its_backoff(
+    world: World,
+) -> None:
+    world.bind(1, actual=3, available=0)
+    world.erpnext.failing.add("Item")
+    world.worker.run_pass(NOW)
+    world.worker.run_pass(NOW + POLL)
+    request(world.worker, full=True)
+    third = NOW + POLL + SECOND
+    world.worker.run_pass(third)
+    assert world.shopify.variant_reads == 3
+    world.erpnext.failing.clear()
+
+    world.worker.run_pass(third + 4 * POLL - SECOND)
+
+    assert world.shopify.variant_reads == 3
+
+    world.worker.run_pass(third + 4 * POLL)
+
+    assert world.worker.last_pass_full
+
+
 # Comparison report
 
 

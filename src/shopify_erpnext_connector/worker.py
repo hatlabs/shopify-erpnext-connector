@@ -32,7 +32,8 @@ kept in memory only: the full pass after a restart retries everything anyway.
 An operator command can ask for a pass with `request_pass` and wait for it
 with `wait_for_pass`. The request wakes the loop from its sleep, and the items
 it names, and a requested full pass, skip their retry waits: the operator
-asked for this attempt.
+asked for this attempt. Their failure counts stay, so requests made during an
+outage do not shorten the waits after it.
 """
 
 import logging
@@ -40,7 +41,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
@@ -174,6 +175,12 @@ class _Backoff:
     retry_at: datetime
 
 
+# Requested work is due to whichever pass comes next. That pass may have read
+# its clock before the request, while it waited for the writer lock, so "now"
+# at the request would still be in its future.
+_DUE_AT_ANY_TIME = datetime.min.replace(tzinfo=UTC)
+
+
 @dataclass(frozen=True)
 class _Computed:
     binding: Binding
@@ -266,12 +273,19 @@ class Worker:
         """Ask for a pass to start now; return its ticket for `wait_for_pass`.
 
         Call with `writer_lock` held. `full` makes it a full pass; `items` are
-        computed in it even while they wait to be retried.
+        computed in it even while they wait to be retried. Their failure
+        counts stay, so a requested attempt that fails waits longer still.
         """
         if full:
             self._full_pass_requested = True
-            self._full_pass_backoff = None
-        self._forget_backoff(list(items))
+            if self._full_pass_backoff is not None:
+                self._full_pass_backoff = replace(
+                    self._full_pass_backoff, retry_at=_DUE_AT_ANY_TIME
+                )
+        for code in items:
+            backoff = self._backoff.get(code)
+            if backoff is not None:
+                self._backoff[code] = replace(backoff, retry_at=_DUE_AT_ANY_TIME)
         with self._passes:
             self._wake = True
             self._passes.notify_all()
