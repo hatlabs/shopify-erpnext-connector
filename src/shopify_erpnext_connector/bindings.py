@@ -131,10 +131,10 @@ def compute_bindings(
     by_normalized: dict[str, list[str]] = {}
     for code in sorted(by_code):
         by_normalized.setdefault(_normalize(code), []).append(code)
-    sku_counts = Counter(v.sku for v in push_set if not _is_empty(v.sku))
+    sku_counts = Counter(v.sku for v in push_set if not is_empty_sku(v.sku))
 
     def unbound_reason(v: ShopifyVariant) -> UnboundVariant | None:
-        if _is_empty(v.sku):
+        if is_empty_sku(v.sku):
             return _unbound(UnboundKind.EMPTY_SKU, v)
         if sku_counts[v.sku] > 1:
             others = tuple(
@@ -178,7 +178,7 @@ def compute_bindings(
     return BindingResult(tuple(bindings), tuple(unbound))
 
 
-def _is_empty(sku: str) -> bool:
+def is_empty_sku(sku: str) -> bool:
     return not sku.strip()
 
 

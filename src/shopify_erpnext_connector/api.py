@@ -45,6 +45,7 @@ from urllib.parse import parse_qsl, urlsplit
 from shopify_erpnext_connector.bindings import (
     accept_sku_change,
     bound_item_code,
+    is_empty_sku,
     load_sku_change,
     load_sku_changes,
 )
@@ -449,11 +450,17 @@ class ApiServer:
             if problem is None or problem.resolved_at is not None
             else problem.details.get(SKU_DETAIL)
         )
-        if sku is None or sku == NO_SKU:
+        if sku is None:
             return self.error(
                 HTTPStatus.CONFLICT,
-                f"variant {variant_id} has no new SKU recorded to accept;"
+                f"variant {variant_id} has no changed-SKU problem recorded;"
                 " retry after the next full pass",
+            )
+        if sku == NO_SKU or is_empty_sku(sku):
+            return self.error(
+                HTTPStatus.CONFLICT,
+                f"variant {variant_id} has no SKU in Shopify;"
+                " there is nothing to accept",
             )
         accept_sku_change(connection, variant_id, sku)
         detail = {

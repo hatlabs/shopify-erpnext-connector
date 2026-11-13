@@ -3,7 +3,7 @@ import logging
 import socket
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -1309,33 +1309,50 @@ def test_a_mutation_outwaits_one_upstream_call() -> None:
     assert api.WRITER_LOCK_TIMEOUT_SECONDS > READ_TIMEOUT_SECONDS
 
 
-def test_accepting_a_sku_change_without_a_recorded_sku_is_a_conflict(
-    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
-) -> None:
+def hold_without_problem(store: sqlite3.Connection) -> None:
     store.execute(
         "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
         " VALUES (?, 'TEST-ITEM-001', ?)",
         (VARIANT, utc_timestamp(NOW)),
     )
 
+
+def hold_with_resolved_problem(store: sqlite3.Connection) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+    record_check(store, ProblemKind.CHANGED_SKU, [], NOW, checked={VARIANT})
+
+
+def hold_with_sku(sku: str) -> Callable[[sqlite3.Connection], None]:
+    def hold(store: sqlite3.Connection) -> None:
+        hold_sku_change(store, VARIANT, "TEST-ITEM-001", sku)
+
+    return hold
+
+
+@pytest.mark.parametrize(
+    ("hold", "message"),
+    [
+        (hold_without_problem, "retry after the next full pass"),
+        (hold_with_resolved_problem, "retry after the next full pass"),
+        (hold_with_sku(NO_SKU), "no SKU in Shopify"),
+        (hold_with_sku(" \t"), "no SKU in Shopify"),
+    ],
+    ids=["no problem", "resolved problem", "no SKU", "blank SKU"],
+)
+def test_accepting_a_sku_change_with_no_sku_to_accept_is_a_conflict(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    hold: Callable[[sqlite3.Connection], None],
+    message: str,
+) -> None:
+    hold(store)
+
     response = accept_sku_change(client, VARIANT)
 
     assert response.status_code == 409
     assert response.json()["environment"] == "staging"
-    assert "SKU" in response.json()["error"]
-    assert audit_rows(store) == []
-    assert worker.full_passes_requested == 0
-    assert load_accepted(store) == {}
-
-
-def test_accepting_a_cleared_sku_is_a_conflict(
-    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
-) -> None:
-    hold_sku_change(store, VARIANT, "TEST-ITEM-001", NO_SKU)
-
-    response = accept_sku_change(client, VARIANT)
-
-    assert response.status_code == 409
+    assert message in response.json()["error"]
     assert audit_rows(store) == []
     assert worker.full_passes_requested == 0
     assert load_accepted(store) == {}
