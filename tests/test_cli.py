@@ -4,13 +4,14 @@ import shlex
 import socket
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import entry_points
 from pathlib import Path
 
+import httpx
 import pytest
 from helpers import FakeWorker, make_config
 
@@ -1154,5 +1155,29 @@ def test_a_mutation_refused_while_a_pass_runs_says_to_retry(
     assert "retry" in err
 
 
-def test_a_mutation_outwaits_the_connectors_wait_for_a_pass() -> None:
-    assert cli.MUTATION_TIMEOUT_SECONDS > WRITER_LOCK_TIMEOUT_SECONDS
+def test_a_mutation_outwaits_the_connectors_wait_for_a_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    timeouts: list[float] = []
+
+    def post(
+        url: str,
+        *,
+        json: Mapping[str, object],
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> httpx.Response:
+        timeouts.append(timeout)
+        answer = {"environment": "staging", "dry_run": False, "changed": True}
+        return httpx.Response(200, json=answer, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    configure(monkeypatch, tmp_path, "http://connector.example.com")
+
+    code, _, err = run(capsys, "dry-run", "off")
+
+    assert code == 0, err
+    (timeout,) = timeouts
+    assert timeout > WRITER_LOCK_TIMEOUT_SECONDS
