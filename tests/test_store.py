@@ -14,6 +14,7 @@ from shopify_erpnext_connector.store import (
     open_store,
     purge_push_history,
     set_dry_run,
+    transaction,
     utc_timestamp,
 )
 
@@ -252,3 +253,43 @@ def test_a_store_from_before_the_settings_migration_starts_in_dry_run(
 
     assert dry_run(connection) is True
     connection.close()
+
+
+def test_held_sku_changes_survive_the_accepted_sku_migration(db_path: Path) -> None:
+    connection = sqlite3.connect(db_path, isolation_level=None)
+    migrate(connection, MIGRATIONS[:4])
+    connection.execute(
+        "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
+        " VALUES (?, 'TEST-OLD', '2026-11-12T10:00:00.000000Z')",
+        (VARIANT_ID,),
+    )
+
+    migrate(connection, MIGRATIONS)
+
+    row = connection.execute(
+        "SELECT variant_id, bound_item_code, accepted_sku FROM sku_changes"
+    ).fetchone()
+    assert row == (VARIANT_ID, "TEST-OLD", None)
+    connection.close()
+
+
+# Short enough that a writer refused the lock fails the test quickly.
+BUSY_TIMEOUT_SECONDS = 0.05
+
+
+def test_a_transaction_holds_the_write_lock_from_its_start(db_path: Path) -> None:
+    """A write committed elsewhere between a transaction's read and its write
+    would make SQLite refuse the transaction's write; holding the lock from
+    BEGIN keeps other writers out instead."""
+    worker = open_store(db_path)
+    other = sqlite3.connect(db_path, isolation_level=None, timeout=BUSY_TIMEOUT_SECONDS)
+
+    with transaction(worker):
+        dry_run(worker)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            other.execute("BEGIN IMMEDIATE")
+        set_dry_run(worker, False)
+
+    assert dry_run(other) is False
+    other.close()
+    worker.close()

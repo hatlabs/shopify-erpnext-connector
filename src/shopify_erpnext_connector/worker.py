@@ -10,7 +10,8 @@ the bindings and recomputes every bound variant, so a missed change or an
 edit made in Shopify is corrected within the hour.
 
 The whole pass holds the writer lock, so a CLI mutation never interleaves
-with a pass's reads and writes. A failed read ends the pass with the dirty
+with a pass's reads and writes. Dry-run is read once at the start of a pass,
+so setting it needs no lock. A failed read ends the pass with the dirty
 items kept for the next one; the push staleness check and problem emails
 still run, since a Shopify outage is what the staleness check reports. A
 bound item dirty past the threshold is reported as well as a queued value,
@@ -112,6 +113,8 @@ _POLICY_TEXTS = {
 
 # The binding problems' detail naming the variant's current SKU.
 SKU_DETAIL = "SKU"
+# The SKU detail of a variant with no SKU.
+NO_SKU = "(none)"
 
 _BINDING_PROBLEM_KINDS = {
     UnboundKind.EMPTY_SKU: ProblemKind.UNBOUND_SKU,
@@ -231,6 +234,10 @@ class Worker:
     def last_full_pass_at(self) -> datetime | None:
         """When the last full pass that completed started; None before the first."""
         return self._last_full_pass_at
+
+    def request_full_pass(self) -> None:
+        """Make the next pass a full one; call with `writer_lock` held."""
+        self._full_pass_requested = True
 
     def run(self, stop: threading.Event) -> None:
         interval = self._config.worker.poll_interval.total_seconds()
@@ -556,13 +563,25 @@ def _oversell(computed: _Computed, match: OrderMatch) -> Problem:
 
 def _binding_details(variant: UnboundVariant) -> dict[str, str]:
     details = {
-        SKU_DETAIL: variant.sku or "(none)",
+        SKU_DETAIL: variant.sku or NO_SKU,
         "Reason": _BINDING_REASONS[variant.kind],
     }
+    if variant.kind is not UnboundKind.SKU_CHANGED:
+        return details | _related_details(variant)
+    details["Bound item"] = variant.item_codes[0]
+    blocker = variant.accepted_unbound
+    if blocker is not None:
+        reason = _BINDING_REASONS[blocker.kind]
+        details["Accepted SKU"] = f"Does not bind yet: {reason}"
+        details |= _related_details(blocker)
+    return details
+
+
+def _related_details(variant: UnboundVariant) -> dict[str, str]:
+    """The Items and variants that keep `variant` from binding."""
+    details: dict[str, str] = {}
     if variant.kind is UnboundKind.NEAR_MATCH:
         details["Similar item codes"] = ", ".join(variant.item_codes)
-    elif variant.kind is UnboundKind.SKU_CHANGED:
-        details["Bound item"] = variant.item_codes[0]
     elif variant.item_codes:
         details["Item"] = variant.item_codes[0]
     if variant.other_variant_ids:

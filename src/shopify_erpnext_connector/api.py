@@ -12,6 +12,14 @@ to the thread that made them, and the store's WAL mode lets them read while
 the worker writes. Worker state is read through the worker's public
 properties only.
 
+Mutations are POST requests with a JSON object body. Each runs in one store
+transaction with its audit row; an answer of 400 or above rolls the
+transaction back, so a refused mutation leaves nothing behind. A mutation of
+what a pass works on first takes the worker's writer lock, waiting at most
+`writer_lock_timeout` for a running pass. Dry-run does not: a pass reads it
+once at its start, so a change takes effect from the next pass and can be
+made while ERPNext or Shopify is slow.
+
 Request logs go through `logging` and never include headers, so a token is
 never logged.
 """
@@ -35,7 +43,9 @@ from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
 
 from shopify_erpnext_connector.bindings import (
+    accept_sku_change,
     bound_item_code,
+    is_empty_sku,
     load_sku_change,
     load_sku_changes,
 )
@@ -55,8 +65,13 @@ from shopify_erpnext_connector.problems import (
     problem_key,
 )
 from shopify_erpnext_connector.push import recent_pushes, unpushed_since
-from shopify_erpnext_connector.store import dry_run, utc_timestamp
-from shopify_erpnext_connector.worker import BINDING_PROBLEM_KINDS, SKU_DETAIL
+from shopify_erpnext_connector.retry import READ_TIMEOUT_SECONDS
+from shopify_erpnext_connector.store import dry_run, set_dry_run, utc_timestamp
+from shopify_erpnext_connector.worker import (
+    BINDING_PROBLEM_KINDS,
+    NO_SKU,
+    SKU_DETAIL,
+)
 
 ENVIRONMENT_HEADER = "X-Connector-Environment"
 JSON_CONTENT_TYPE = "application/json"
@@ -73,6 +88,18 @@ SHUTDOWN_POLL_SECONDS = 0.1
 # A client that sends nothing for this long is disconnected, so a stalled
 # connection cannot hold a handler thread for good.
 REQUEST_TIMEOUT_SECONDS = 30.0
+# How long a mutation waits for a running pass to release the writer lock. A
+# pass holds it across upstream calls; this outlasts one attempt's read
+# timeout, with room for the connect, but not a retried call or a whole slow
+# pass, after which the mutation answers 503 and the operator retries.
+WRITER_LOCK_MARGIN_SECONDS = 30.0
+WRITER_LOCK_TIMEOUT_SECONDS = READ_TIMEOUT_SECONDS + WRITER_LOCK_MARGIN_SECONDS
+# Request bodies hold a few identifiers; anything larger is refused unread.
+MAX_BODY_BYTES = 64 * 1024
+
+# Audit log action names; stable, so the log can be searched by them.
+DRY_RUN_ACTION = "dry-run"
+ACCEPT_SKU_CHANGE_ACTION = "accept-sku-change"
 
 _BEARER_SCHEME = "bearer"
 
@@ -92,6 +119,11 @@ class WorkerState(Protocol):
 
     @property
     def last_full_pass_at(self) -> datetime | None: ...
+
+    @property
+    def writer_lock(self) -> threading.Lock: ...
+
+    def request_full_pass(self) -> None: ...
 
 
 def audit(
@@ -142,6 +174,7 @@ class _Request:
     connection: sqlite3.Connection
     operator: str | None
     query: Mapping[str, str]
+    body: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -149,6 +182,8 @@ class _Route:
     method: str
     access: _Access
     handle: Callable[["ApiServer", _Request], _Response]
+    # Whether a mutation waits for the worker's writer lock.
+    writer_lock: bool = True
 
 
 class ApiServer:
@@ -161,8 +196,10 @@ class ApiServer:
         *,
         clock: Callable[[], datetime] = _utc_now,
         request_timeout: float = REQUEST_TIMEOUT_SECONDS,
+        writer_lock_timeout: float = WRITER_LOCK_TIMEOUT_SECONDS,
     ) -> None:
         self.request_timeout = request_timeout
+        self.writer_lock_timeout = writer_lock_timeout
         self._config = config
         self._worker = worker
         self._clock = clock
@@ -224,6 +261,36 @@ class ApiServer:
         if requested != serving:
             return f"this connector serves {serving}, not {requested}"
         return None
+
+    def mutate(self, route: _Route, request: _Request) -> _Response:
+        """Run a mutation in one transaction, under the writer lock if it takes it."""
+        if not route.writer_lock:
+            return self._transact(route, request)
+        lock = self._worker.writer_lock
+        if not lock.acquire(timeout=self.writer_lock_timeout):
+            return self.error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "a pass is running; retry the command in a moment",
+            )
+        try:
+            return self._transact(route, request)
+        finally:
+            lock.release()
+
+    def _transact(self, route: _Route, request: _Request) -> _Response:
+        connection = request.connection
+        # IMMEDIATE: what the handler reads cannot change before it writes.
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            response = route.handle(self, request)
+        except BaseException:
+            # SQLite may have rolled back on its own, as after a disk-full error.
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        refused = response.status >= HTTPStatus.BAD_REQUEST
+        connection.execute("ROLLBACK" if refused else "COMMIT")
+        return response
 
     def connect(self) -> sqlite3.Connection:
         # mode=rw: a missing store is an error, not a new empty database.
@@ -290,6 +357,7 @@ class ApiServer:
                         "variant_id": change.variant_id,
                         "bound_item_code": change.bound_item_code,
                         "sku": new_skus.get(change.variant_id),
+                        "accepted_sku": change.accepted_sku,
                         "detected_at": change.detected_at,
                     }
                     for change in load_sku_changes(request.connection)
@@ -350,6 +418,84 @@ class ApiServer:
     def report(self, request: _Request) -> _Response:
         rows = comparison_report(request.connection)
         return self.json(HTTPStatus.OK, {"rows": [asdict(row) for row in rows]})
+
+    def set_dry_run(self, request: _Request) -> _Response:
+        on = request.body.get("on")
+        if not isinstance(on, bool):
+            return self.error(
+                HTTPStatus.BAD_REQUEST, "the body needs 'on' as true or false"
+            )
+        connection = request.connection
+        was = dry_run(connection)
+        if on != was:
+            set_dry_run(connection, on)
+            self.audit_mutation(request, DRY_RUN_ACTION, {"old": was, "new": on})
+        return self.json(HTTPStatus.OK, {"dry_run": on, "changed": on != was})
+
+    def accept_sku_change(self, request: _Request) -> _Response:
+        variant_id = request.body.get("variant")
+        if not isinstance(variant_id, str) or not variant_id:
+            return self.error(
+                HTTPStatus.BAD_REQUEST, "the body needs 'variant' as a variant GID"
+            )
+        given_sku = request.body.get("sku")
+        if not isinstance(given_sku, str) or not given_sku:
+            return self.error(
+                HTTPStatus.BAD_REQUEST,
+                "the body needs 'sku' as the SKU that `bindings` shows",
+            )
+        connection = request.connection
+        change = load_sku_change(connection, variant_id)
+        if change is None:
+            return self.error(
+                HTTPStatus.NOT_FOUND, f"variant {variant_id} has no held SKU change"
+            )
+        problem = get_problem(connection, ProblemKind.CHANGED_SKU, variant_id)
+        sku = (
+            None
+            if problem is None or problem.resolved_at is not None
+            else problem.details.get(SKU_DETAIL)
+        )
+        if sku is None:
+            return self.error(
+                HTTPStatus.CONFLICT,
+                f"variant {variant_id} has no changed-SKU problem recorded;"
+                " retry after the next full pass",
+            )
+        if sku == NO_SKU or is_empty_sku(sku):
+            return self.error(
+                HTTPStatus.CONFLICT,
+                f"variant {variant_id} has no SKU in Shopify;"
+                " there is nothing to accept",
+            )
+        if sku != given_sku:
+            return self.error(
+                HTTPStatus.CONFLICT,
+                f"variant {variant_id} now has SKU {sku}, not {given_sku};"
+                " check `bindings` again",
+            )
+        accept_sku_change(connection, variant_id, sku)
+        detail = {
+            "variant_id": variant_id,
+            "bound_item_code": change.bound_item_code,
+            "accepted_sku": sku,
+        }
+        self.audit_mutation(request, ACCEPT_SKU_CHANGE_ACTION, detail)
+        self._worker.request_full_pass()
+        return self.json(HTTPStatus.OK, detail)
+
+    def audit_mutation(
+        self, request: _Request, action: str, detail: Mapping[str, object]
+    ) -> None:
+        # Operator routes reach a handler only with an operator's token.
+        assert request.operator is not None
+        audit(
+            request.connection,
+            request.operator,
+            action,
+            json.dumps(detail),
+            self._clock(),
+        )
 
     def metrics(self, request: _Request) -> _Response:
         connection = request.connection
@@ -431,6 +577,12 @@ _ROUTES: Mapping[str, _Route] = {
     "/bindings": _Route("GET", _Access.OPERATOR, ApiServer.bindings),
     "/record": _Route("GET", _Access.OPERATOR, ApiServer.record),
     "/report": _Route("GET", _Access.OPERATOR, ApiServer.report),
+    "/dry-run": _Route(
+        "POST", _Access.OPERATOR, ApiServer.set_dry_run, writer_lock=False
+    ),
+    "/bindings/accept-sku-change": _Route(
+        "POST", _Access.OPERATOR, ApiServer.accept_sku_change
+    ),
 }
 
 
@@ -449,6 +601,17 @@ def _problem_json(problem: StoredProblem) -> dict[str, object]:
             "communication": problem.communication_name,
         },
     }
+
+
+def _json_object(content: bytes) -> Mapping[str, object] | str:
+    """The body as a JSON object, or why it is not one."""
+    try:
+        document: object = json.loads(content) if content else None
+    except (ValueError, RecursionError):
+        return "the body is not valid JSON"
+    if not isinstance(document, dict):
+        return "the body must be a JSON object"
+    return {str(key): value for key, value in document.items()}
 
 
 def _bearer_token(authorization: str | None) -> bytes | None:
@@ -484,6 +647,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _respond(self) -> _Response:
         api = self._api
+        # Read before answering anything: closing a connection with unread
+        # data resets it, and the client could lose the answer.
+        content = self._read_body()
+        if isinstance(content, _Response):
+            return content
         url = urlsplit(self.path)
         path = url.path
         route = _ROUTES.get(path)
@@ -519,12 +687,18 @@ class _Handler(BaseHTTPRequestHandler):
             refusal = api.wrong_environment(self.headers.get(ENVIRONMENT_HEADER))
             if refusal is not None:
                 return api.error(HTTPStatus.CONFLICT, refusal)
+        body: Mapping[str, object] = {}
+        if route.method != "GET":
+            parsed = _json_object(content)
+            if isinstance(parsed, str):
+                return api.error(HTTPStatus.BAD_REQUEST, parsed)
+            body = parsed
         try:
             with closing(api.connect()) as connection:
                 query = dict(parse_qsl(url.query))
-                request = _Request(connection, self._operator, query)
+                request = _Request(connection, self._operator, query, body)
                 if route.method != "GET":
-                    return route.handle(api, request)
+                    return api.mutate(route, request)
                 # One read transaction, so every statement of the handler sees
                 # the same WAL snapshot even while the worker commits a pass.
                 connection.execute("BEGIN")
@@ -539,6 +713,21 @@ class _Handler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 "the request failed; the connector's log has the details",
             )
+
+    def _read_body(self) -> bytes | _Response:
+        api = self._api
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0:
+            return api.error(HTTPStatus.BAD_REQUEST, "bad Content-Length")
+        if length > MAX_BODY_BYTES:
+            return api.error(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                f"the body is over {MAX_BODY_BYTES} bytes",
+            )
+        return self.rfile.read(length)
 
     def _send(self, response: _Response) -> None:
         self.send_response(response.status)

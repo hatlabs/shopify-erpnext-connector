@@ -4,18 +4,23 @@ import shlex
 import socket
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import entry_points
 from pathlib import Path
 
+import httpx
 import pytest
-from helpers import make_config
+from helpers import FakeWorker, make_config
 
 from shopify_erpnext_connector import cli
-from shopify_erpnext_connector.api import ENVIRONMENT_HEADER, ApiServer
+from shopify_erpnext_connector.api import (
+    ENVIRONMENT_HEADER,
+    WRITER_LOCK_TIMEOUT_SECONDS,
+    ApiServer,
+)
 from shopify_erpnext_connector.config import ApiConfig, Environment, Secret
 from shopify_erpnext_connector.decisions import Decision, save_decisions
 from shopify_erpnext_connector.problems import (
@@ -29,7 +34,7 @@ from shopify_erpnext_connector.problems import (
     show_command,
 )
 from shopify_erpnext_connector.push import PushOutcome
-from shopify_erpnext_connector.store import open_store, utc_timestamp
+from shopify_erpnext_connector.store import dry_run, open_store, utc_timestamp
 
 CLI_NAME = "shopify-erpnext-connector"
 NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
@@ -53,19 +58,13 @@ STATUS = {
 
 
 @dataclass
-class FakeWorker:
-    last_pass_at: None = None
-    last_pass_full: bool = False
-    last_full_pass_at: None = None
-
-
-@dataclass
 class Canned:
-    """What the canned connector answers, and the headers it was sent."""
+    """What the canned connector answers, and the requests it was sent."""
 
     status: int = 200
     body: bytes = b"{}"
     received: list[dict[str, str]] = field(default_factory=list)
+    posted: list[tuple[str, object]] = field(default_factory=list)
 
     def answer(self, status: int, document: dict[str, object]) -> None:
         self.status = status
@@ -74,10 +73,15 @@ class Canned:
 
 @pytest.fixture
 def canned() -> Iterator[tuple[Canned, str]]:
-    """A connector stand-in answering every GET with a set response."""
+    """A connector stand-in answering every GET and POST with a set response."""
     state = Canned()
 
     class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            state.posted.append((self.path, json.loads(self.rfile.read(length))))
+            self.do_GET()
+
         def do_GET(self) -> None:
             state.received.append(dict(self.headers.items()))
             self.send_response(state.status)
@@ -297,12 +301,11 @@ def test_environment_defaults_to_staging(
     target = cli.resolve_target(None, os.environ)
 
     assert target.environment is Environment.STAGING
-    assert target.explicit is False
     assert target.url == "http://connector.example.com"
     assert target.token.reveal() == OPERATOR_TOKEN
 
 
-def test_environment_from_the_environment_variable_is_not_explicit(
+def test_environment_from_the_environment_variable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     configure(monkeypatch, tmp_path, "https://connector.example.com", "production")
@@ -311,10 +314,9 @@ def test_environment_from_the_environment_variable_is_not_explicit(
     target = cli.resolve_target(None, os.environ)
 
     assert target.environment is Environment.PRODUCTION
-    assert target.explicit is False
 
 
-def test_env_option_overrides_the_variable_and_is_explicit(
+def test_env_option_overrides_the_variable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     configure(monkeypatch, tmp_path, "https://connector.example.com", "production")
@@ -323,7 +325,6 @@ def test_env_option_overrides_the_variable_and_is_explicit(
     target = cli.resolve_target("production", os.environ)
 
     assert target.environment is Environment.PRODUCTION
-    assert target.explicit is True
 
 
 @pytest.mark.parametrize("position", ["before", "after"])
@@ -938,3 +939,302 @@ def test_report_before_any_computation(capsys: pytest.CaptureFixture[str]) -> No
 
     assert code == 0
     assert "No bound variant has been computed yet" in out
+
+
+# Mutations
+
+
+def audit_rows(store: sqlite3.Connection) -> list[tuple[str, str]]:
+    return store.execute("SELECT operator, action FROM audit_log").fetchall()
+
+
+def hold(store: sqlite3.Connection, variant_id: str, item_code: str, sku: str) -> None:
+    store.execute(
+        "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
+        " VALUES (?, ?, ?)",
+        (variant_id, item_code, utc_timestamp(NOW)),
+    )
+    record_check(
+        store,
+        ProblemKind.CHANGED_SKU,
+        [Problem(ProblemKind.CHANGED_SKU, variant_id, {"SKU": sku})],
+        NOW,
+    )
+
+
+@pytest.mark.usefixtures("connected")
+def test_dry_run_off_turns_it_off(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = run(capsys, "dry-run", "off")
+
+    assert code == 0, err
+    assert out.splitlines() == [
+        "Environment: staging",
+        "Dry run: off, was on",
+        "This takes effect from the next pass.",
+    ]
+    assert dry_run(store) is False
+    assert audit_rows(store) == [("alice", "dry-run")]
+
+
+@pytest.mark.usefixtures("connected")
+def test_dry_run_on_when_already_on_says_so(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = run(capsys, "dry-run", "on")
+
+    assert code == 0, err
+    assert "Dry run: already on; nothing changed" in out.splitlines()
+    assert audit_rows(store) == []
+
+
+@pytest.mark.usefixtures("connected")
+def test_dry_run_as_json(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = run(capsys, "dry-run", "off", "--json")
+
+    assert code == 0
+    assert json.loads(out) == {
+        "environment": "staging",
+        "dry_run": False,
+        "changed": True,
+    }
+
+
+def test_dry_run_takes_on_or_off(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit:
+        cli.main(["dry-run", "maybe"])
+
+    assert exit.value.code == USAGE_ERROR
+
+
+@pytest.mark.usefixtures("connected")
+def test_accept_sku_change_names_the_accepted_sku(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hold(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+
+    code, out, err = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"
+    )
+
+    assert code == 0, err
+    assert out.splitlines() == [
+        "Environment: staging",
+        f"Accepted SKU TEST-SKU-001-NEW for {VARIANT},"
+        " which was bound to TEST-ITEM-001.",
+        "The next full pass binds it by that SKU if the variant still has it.",
+    ]
+    assert audit_rows(store) == [("alice", "accept-sku-change")]
+    code, out, err = run(capsys, "bindings")
+    assert code == 0, err
+    assert "accepted TEST-SKU-001-NEW" in out
+
+
+@pytest.mark.usefixtures("connected")
+def test_accept_sku_change_as_json(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hold(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+
+    code, out, _ = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW", "--json"
+    )
+
+    assert code == 0
+    assert json.loads(out)["bound_item_code"] == "TEST-ITEM-001"
+
+
+@pytest.mark.usefixtures("connected")
+def test_accept_sku_change_without_a_hold_is_reported(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"
+    )
+
+    assert code == cli.EXIT_FAILURE
+    assert out == ""
+    assert err.startswith(f"{CLI_NAME}: staging: ")
+    assert "404" in err
+    assert f"{VARIANT} has no held SKU change" in err
+    assert audit_rows(store) == []
+
+
+@pytest.mark.usefixtures("connected")
+def test_accept_sku_change_refuses_a_sku_bindings_no_longer_shows(
+    store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hold(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEWER")
+
+    code, out, err = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"
+    )
+
+    assert code == cli.EXIT_FAILURE
+    assert out == ""
+    assert "409" in err
+    assert "TEST-SKU-001-NEWER" in err
+    assert audit_rows(store) == []
+
+
+def test_accept_sku_change_posts_the_variant_and_the_sku(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    state, url = canned
+    state.answer(
+        200,
+        {
+            "environment": "staging",
+            "variant_id": VARIANT,
+            "bound_item_code": "TEST-ITEM-001",
+            "accepted_sku": "TEST-SKU-001-NEW",
+        },
+    )
+    configure(monkeypatch, tmp_path, url)
+
+    code, _, err = run(
+        capsys, "bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"
+    )
+
+    assert code == 0, err
+    assert state.posted == [
+        (
+            "/bindings/accept-sku-change",
+            {"variant": VARIANT, "sku": "TEST-SKU-001-NEW"},
+        )
+    ]
+
+
+def test_a_mutation_posts_its_body_with_the_token_and_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    state, url = canned
+    state.answer(200, {"environment": "staging", "dry_run": False, "changed": True})
+    configure(monkeypatch, tmp_path, url)
+
+    code, _, err = run(capsys, "dry-run", "off")
+
+    assert code == 0, err
+    assert state.posted == [("/dry-run", {"on": False})]
+    (headers,) = state.received
+    assert headers[AUTH_HEADER] == f"Bearer {OPERATOR_TOKEN}"
+    assert headers[ENVIRONMENT_HEADER] == "staging"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["dry-run", "off"],
+        ["bindings", "accept-sku-change", VARIANT, "TEST-SKU-001-NEW"],
+    ],
+)
+def test_a_mutation_on_production_needs_env_on_the_command_line(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+    argv: list[str],
+) -> None:
+    state, url = canned
+    token_file = configure(monkeypatch, tmp_path, url, "production")
+    # The refusal comes before the token is read, so a missing file is not
+    # what stops the command.
+    token_file.unlink()
+    monkeypatch.setenv("CONNECTOR_ENV", "production")
+
+    code, out, err = run(capsys, *argv)
+
+    assert code == cli.EXIT_FAILURE
+    assert out == ""
+    assert "--env production" in err
+    assert str(token_file) not in err
+    assert state.received == []
+
+
+def test_a_mutation_on_production_runs_with_env_on_the_command_line(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    state, url = canned
+    state.answer(200, {"environment": "production", "dry_run": False, "changed": True})
+    configure(monkeypatch, tmp_path, url, "production")
+
+    code, out, err = run(capsys, "--env", "production", "dry-run", "off")
+
+    assert code == 0, err
+    assert "Environment: production" in out
+    assert state.posted == [("/dry-run", {"on": False})]
+
+
+def test_reads_on_production_need_no_env_option(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    state, url = canned
+    state.answer(200, {"environment": "production"} | STATUS)
+    configure(monkeypatch, tmp_path, url, "production")
+    monkeypatch.setenv("CONNECTOR_ENV", "production")
+
+    code, _, err = run(capsys, "status")
+
+    assert code == 0, err
+
+
+def test_a_mutation_refused_while_a_pass_runs_says_to_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+) -> None:
+    state, url = canned
+    state.answer(
+        503,
+        {"environment": "staging", "error": "a pass is running; retry the command"},
+    )
+    configure(monkeypatch, tmp_path, url)
+
+    code, out, err = run(capsys, "dry-run", "off")
+
+    assert code == cli.EXIT_FAILURE
+    assert out == ""
+    assert "503" in err
+    assert "retry" in err
+
+
+def test_a_mutation_outwaits_the_connectors_wait_for_a_pass(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    timeouts: list[float] = []
+
+    def post(
+        url: str,
+        *,
+        json: Mapping[str, object],
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> httpx.Response:
+        timeouts.append(timeout)
+        answer = {"environment": "staging", "dry_run": False, "changed": True}
+        return httpx.Response(200, json=answer, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", post)
+    configure(monkeypatch, tmp_path, "http://connector.example.com")
+
+    code, _, err = run(capsys, "dry-run", "off")
+
+    assert code == 0, err
+    (timeout,) = timeouts
+    assert timeout > WRITER_LOCK_TIMEOUT_SECONDS

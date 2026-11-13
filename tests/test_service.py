@@ -14,14 +14,14 @@ from shopify_erpnext_connector.store import dry_run, open_store
 from shopify_erpnext_connector.worker import Worker
 
 EXAMPLE_CONFIG = Path(__file__).parent.parent / "config.example.toml"
+OPERATOR_TOKEN_NAME = "operator_token_alice"
 SECRET_NAMES = [
     "erpnext_api_key",
     "erpnext_api_secret",
     "shopify_access_token",
     "metrics_token",
-    "operator_token_alice",
+    OPERATOR_TOKEN_NAME,
 ]
-SECRET_VALUE = "placeholder"
 # Kept apart from its value so the fixture check's header pattern stays meaningful.
 AUTH_HEADER = "Authorization"
 
@@ -48,7 +48,9 @@ def write_config(
     api_port: int,
 ) -> None:
     for name in SECRET_NAMES:
-        (tmp_path / name).write_text(SECRET_VALUE)
+        # Distinct values: the config refuses an operator token that is
+        # also the metrics token.
+        (tmp_path / name).write_text(f"placeholder-{name}")
     example = EXAMPLE_CONFIG.read_text()
     default_port = f"port = {DEFAULT_API_PORT}"
     assert default_port in example
@@ -116,7 +118,7 @@ def test_api_serves_while_the_worker_runs_and_stops_with_it(
         response = httpx.get(
             base_url + "/status",
             headers={
-                AUTH_HEADER: f"Bearer {SECRET_VALUE}",
+                AUTH_HEADER: f"Bearer placeholder-{OPERATOR_TOKEN_NAME}",
                 ENVIRONMENT_HEADER: "staging",
             },
         )

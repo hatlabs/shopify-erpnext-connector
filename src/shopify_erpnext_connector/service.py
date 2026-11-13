@@ -11,6 +11,10 @@ import httpx
 from shopify_erpnext_connector.api import ApiServer
 from shopify_erpnext_connector.config import ConfigError, load_config
 from shopify_erpnext_connector.erpnext import ErpNextClient
+from shopify_erpnext_connector.retry import (
+    CONNECT_TIMEOUT_SECONDS,
+    READ_TIMEOUT_SECONDS,
+)
 from shopify_erpnext_connector.shopify import ShopifyClient
 from shopify_erpnext_connector.store import StoreError, open_store
 from shopify_erpnext_connector.worker import Worker
@@ -19,11 +23,6 @@ CONFIG_PATH_VARIABLE = "CONNECTOR_CONFIG"
 SECRETS_DIR_VARIABLE = "CONNECTOR_SECRETS_DIR"
 DEFAULT_CONFIG_PATH = "/etc/shopify-erpnext-connector/config.toml"
 DEFAULT_SECRETS_DIR = "/run/secrets"
-
-CONNECT_TIMEOUT_SECONDS = 10.0
-# ERPNext's email `make` sends over SMTP, with an OAuth token fetch, inside
-# the request.
-READ_TIMEOUT_SECONDS = 60.0
 
 
 def install_stop_handlers(stop: threading.Event) -> None:

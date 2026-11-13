@@ -123,6 +123,11 @@ MIGRATIONS: tuple[str, ...] = (
     );
     INSERT INTO settings (id, dry_run) VALUES (1, 1);
     """,
+    """
+    -- The SKU an operator accepted for a held change: the next full pass binds
+    -- the variant only if its SKU is still this one.
+    ALTER TABLE sku_changes ADD COLUMN accepted_sku TEXT;
+    """,
 )
 
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
@@ -180,8 +185,13 @@ def purge_push_history(connection: sqlite3.Connection, now: datetime) -> int:
 
 @contextmanager
 def transaction(connection: sqlite3.Connection) -> Generator[None]:
-    """Commit the block's writes together, or roll them all back on an error."""
-    connection.execute("BEGIN")
+    """Commit the block's writes together, or roll them all back on an error.
+
+    The write lock is taken at the start: a writer on another connection
+    committing between this block's reads and its first write would make
+    SQLite refuse that write instead of waiting.
+    """
+    connection.execute("BEGIN IMMEDIATE")
     try:
         yield
         connection.execute("COMMIT")

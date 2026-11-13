@@ -1,6 +1,7 @@
 import json
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,7 +9,9 @@ import httpx
 import pytest
 from helpers import ERPNEXT_URL, LOCATION_ID, SHOP_DOMAIN, WAREHOUSE, make_config
 
-from shopify_erpnext_connector.config import Config
+from shopify_erpnext_connector.api import ENVIRONMENT_HEADER, ApiServer
+from shopify_erpnext_connector.bindings import bound_item_code
+from shopify_erpnext_connector.config import ApiConfig, Config, Secret
 from shopify_erpnext_connector.decisions import (
     Decision,
     ReportRow,
@@ -39,6 +42,7 @@ from shopify_erpnext_connector.worker import (
     HELD_ACTION,
     MAX_RETRY_BACKOFF,
     SALE_SETTLE_HOLD,
+    SKU_DETAIL,
     Worker,
 )
 
@@ -1030,6 +1034,18 @@ def test_a_full_pass_runs_at_start_and_then_hourly(world: World) -> None:
     assert world.worker.last_pass_at == NOW + FULL_PASS_INTERVAL
 
 
+def test_a_requested_full_pass_runs_next_and_once(world: World) -> None:
+    world.bind(1, actual=3, available=3)
+    world.worker.run_pass(NOW)
+
+    world.worker.request_full_pass()
+    world.worker.run_pass(NOW + SECOND)
+    assert (world.shopify.variant_reads, world.worker.last_pass_full) == (2, True)
+
+    world.worker.run_pass(NOW + 2 * SECOND)
+    assert (world.shopify.variant_reads, world.worker.last_pass_full) == (2, False)
+
+
 def test_last_full_pass_at_is_the_start_of_the_last_completed_full_pass(
     world: World,
 ) -> None:
@@ -1444,3 +1460,139 @@ def test_binding_problem_kinds_are_unbound_ambiguous_then_changed() -> None:
         ProblemKind.AMBIGUOUS_SKU,
         ProblemKind.CHANGED_SKU,
     )
+
+
+# Operator commands through the API
+
+
+OPERATOR_TOKEN = "test-operator-token"
+# Kept apart from its value so the fixture check's header pattern stays meaningful.
+AUTH_HEADER = "Authorization"
+
+
+def accept_sku_change(world: World, n: int, sku: str) -> httpx.Response:
+    """Accept SKU `sku` for variant `n` through the API, as the CLI does."""
+    config = replace(
+        world.config,
+        store_path=world.path,
+        api=ApiConfig(port=0),
+        secrets=replace(
+            world.config.secrets, operator_tokens={"alice": Secret(OPERATOR_TOKEN)}
+        ),
+    )
+    server = ApiServer(config, world.worker)
+    server.start()
+    try:
+        return httpx.post(
+            f"http://127.0.0.1:{server.port}/bindings/accept-sku-change",
+            json={"variant": variant_id(n), "sku": sku},
+            headers={
+                AUTH_HEADER: f"Bearer {OPERATOR_TOKEN}",
+                ENVIRONMENT_HEADER: world.config.environment,
+            },
+        )
+    finally:
+        server.close()
+
+
+def hold_sku_change(world: World, n: int, new_sku: int) -> None:
+    """Bind variant `n`, then change its SKU to item `new_sku`'s code."""
+    world.bind(n, actual=4, available=0)
+    world.worker.run_pass(NOW)
+    world.shopify.set_sku(n, item_code(new_sku))
+    world.erpnext.add_item(item_code(new_sku))
+    world.erpnext.set_bin(item_code(new_sku), actual=2)
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL)
+    assert world.open_of(ProblemKind.CHANGED_SKU) == [variant_id(n)]
+
+
+def test_an_accepted_sku_change_binds_the_variant_to_its_new_sku_next_pass(
+    world: World,
+) -> None:
+    hold_sku_change(world, 9, 10)
+    assert accept_sku_change(world, 9, item_code(10)).status_code == 200
+
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL + SECOND)
+
+    assert world.worker.last_pass_full
+    assert bound_item_code(world.store, variant_id(9)) == item_code(10)
+    assert world.open_of(ProblemKind.CHANGED_SKU) == []
+    assert world.shopify.available(9) == 2
+    operators = world.store.execute("SELECT operator FROM audit_log").fetchall()
+    assert operators == [("alice",)]
+
+
+def test_a_sku_changed_again_before_acceptance_is_not_accepted(
+    world: World,
+) -> None:
+    hold_sku_change(world, 9, 10)
+    world.shopify.set_sku(9, item_code(11))
+    world.worker.run_pass(NOW + 2 * FULL_PASS_INTERVAL)
+    problem = get_problem(world.store, ProblemKind.CHANGED_SKU, variant_id(9))
+    assert problem is not None
+    assert problem.details[SKU_DETAIL] == item_code(11)
+
+    response = accept_sku_change(world, 9, item_code(10))
+
+    assert response.status_code == 409
+    held = world.store.execute(
+        "SELECT bound_item_code, accepted_sku FROM sku_changes"
+    ).fetchall()
+    assert held == [(item_code(9), None)]
+    assert world.store.execute("SELECT count(*) FROM audit_log").fetchone() == (0,)
+
+
+def test_a_sku_changed_again_after_acceptance_stays_held(world: World) -> None:
+    hold_sku_change(world, 9, 10)
+    assert accept_sku_change(world, 9, item_code(10)).status_code == 200
+    world.shopify.set_sku(9, item_code(11))
+    world.erpnext.add_item(item_code(11))
+    world.erpnext.set_bin(item_code(11), actual=7)
+    before = world.shopify.available(9)
+
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL + SECOND)
+
+    assert world.worker.last_pass_full
+    assert bound_item_code(world.store, variant_id(9)) is None
+    assert world.shopify.available(9) == before
+    problem = get_problem(world.store, ProblemKind.CHANGED_SKU, variant_id(9))
+    assert problem is not None
+    assert problem.resolved_at is None
+    assert problem.details[SKU_DETAIL] == item_code(11)
+    held = world.store.execute(
+        "SELECT bound_item_code, accepted_sku FROM sku_changes"
+    ).fetchall()
+    assert held == [(item_code(9), None)]
+
+
+def test_an_accepted_sku_with_no_item_stays_held_until_its_item_exists(
+    world: World,
+) -> None:
+    world.bind(9, actual=4, available=0)
+    world.worker.run_pass(NOW)
+    world.shopify.set_sku(9, item_code(10))
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL)
+    assert accept_sku_change(world, 9, item_code(10)).status_code == 200
+
+    world.worker.run_pass(NOW + 2 * FULL_PASS_INTERVAL)
+
+    assert world.worker.last_pass_full
+    assert bound_item_code(world.store, variant_id(9)) is None
+    assert world.open_of(ProblemKind.UNBOUND_SKU) == []
+    problem = get_problem(world.store, ProblemKind.CHANGED_SKU, variant_id(9))
+    assert problem is not None
+    assert problem.resolved_at is None
+    assert problem.details == {
+        SKU_DETAIL: item_code(10),
+        "Reason": "The SKU changed since the variant was bound",
+        "Bound item": item_code(9),
+        "Accepted SKU": "Does not bind yet: No ERPNext Item has this item code",
+    }
+
+    world.erpnext.add_item(item_code(10))
+    world.erpnext.set_bin(item_code(10), actual=2)
+    world.worker.run_pass(NOW + 3 * FULL_PASS_INTERVAL)
+
+    assert bound_item_code(world.store, variant_id(9)) == item_code(10)
+    assert world.open_of(ProblemKind.CHANGED_SKU) == []
+    assert world.shopify.available(9) == 2

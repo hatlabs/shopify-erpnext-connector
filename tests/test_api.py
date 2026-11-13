@@ -1,48 +1,53 @@
+import json
 import logging
 import socket
 import sqlite3
-from collections.abc import Iterator
-from dataclasses import dataclass, replace
+import threading
+from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
 
 import httpx
 import pytest
-from helpers import make_config
+from helpers import FakeWorker, make_config
 
 from shopify_erpnext_connector import api
 from shopify_erpnext_connector.api import (
     ENVIRONMENT_HEADER,
+    MAX_BODY_BYTES,
     METRICS_CONTENT_TYPE,
     PASS_STALE_AFTER,
     RECORD_PUSH_HISTORY,
     ApiServer,
     audit,
 )
+from shopify_erpnext_connector.bindings import load_accepted
 from shopify_erpnext_connector.config import ApiConfig, Environment, Secret
 from shopify_erpnext_connector.decisions import Decision, save_decisions
 from shopify_erpnext_connector.poller import mark_dirty
 from shopify_erpnext_connector.problems import Problem, ProblemKind, record_check
 from shopify_erpnext_connector.push import PushOutcome
-from shopify_erpnext_connector.store import open_store, set_dry_run, utc_timestamp
+from shopify_erpnext_connector.retry import READ_TIMEOUT_SECONDS
+from shopify_erpnext_connector.store import (
+    dry_run,
+    open_store,
+    set_dry_run,
+    utc_timestamp,
+)
+from shopify_erpnext_connector.worker import NO_SKU
 
 NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
 ALICE_TOKEN = "test-alice-token"
 REQUEST_TIMEOUT_SECONDS = 0.5
+WRITER_LOCK_TIMEOUT_SECONDS = 0.5
 BOB_TOKEN = "test-bob-token"
 METRICS_TOKEN = "test-metrics-token"
 # Kept apart from its value so the fixture check's header pattern stays meaningful.
 AUTH_HEADER = "Authorization"
 VARIANT = "gid://shopify/ProductVariant/1001"
 OTHER_VARIANT = "gid://shopify/ProductVariant/1002"
-
-
-@dataclass
-class FakeWorker:
-    last_pass_at: datetime | None = None
-    last_pass_full: bool = False
-    last_full_pass_at: datetime | None = None
 
 
 class Clock:
@@ -91,7 +96,11 @@ def server(store_path: Path, worker: FakeWorker, clock: Clock) -> Iterator[ApiSe
         ),
     )
     server = ApiServer(
-        config, worker, clock=clock, request_timeout=REQUEST_TIMEOUT_SECONDS
+        config,
+        worker,
+        clock=clock,
+        request_timeout=REQUEST_TIMEOUT_SECONDS,
+        writer_lock_timeout=WRITER_LOCK_TIMEOUT_SECONDS,
     )
     server.start()
     yield server
@@ -654,6 +663,7 @@ def hold_sku_change(
         ProblemKind.CHANGED_SKU,
         [Problem(ProblemKind.CHANGED_SKU, variant_id, {"SKU": sku})],
         NOW,
+        checked={variant_id},
     )
 
 
@@ -693,6 +703,7 @@ def test_bindings_lists_unbound_ambiguous_and_held_variants(
             "variant_id": third,
             "bound_item_code": "TEST-ITEM-003",
             "sku": "TEST-SKU-003-NEW",
+            "accepted_sku": None,
             "detected_at": utc_timestamp(NOW),
         }
     ]
@@ -964,3 +975,449 @@ def test_record_without_a_variant_is_a_bad_request(client: httpx.Client) -> None
 
     assert response.status_code == 400
     assert "variant" in response.json()["error"]
+
+
+# The write path
+
+
+def audit_rows(store: sqlite3.Connection) -> list[tuple[str, str, object]]:
+    rows = store.execute("SELECT operator, action, detail FROM audit_log").fetchall()
+    return [
+        (operator, action, None if detail is None else json.loads(detail))
+        for operator, action, detail in rows
+    ]
+
+
+@pytest.fixture
+def probe(monkeypatch: pytest.MonkeyPatch, worker: FakeWorker) -> list[object]:
+    """A POST route at /probe that audits its body; returns the bodies it saw.
+
+    It answers 404 after writing when the body asks it to fail, to show that
+    a refused mutation leaves nothing behind.
+    """
+    seen: list[object] = []
+
+    def handle(server: ApiServer, request: api._Request) -> api._Response:
+        seen.append(dict(request.body))
+        assert worker.writer_lock.locked()
+        assert request.operator is not None
+        audit(request.connection, request.operator, "probe", json.dumps({}), NOW)
+        if request.body.get("fail"):
+            return server.error(HTTPStatus.NOT_FOUND, "probe refused")
+        if request.body.get("raise"):
+            raise RuntimeError("probe failed")
+        if request.body.get("abort"):
+            # As SQLite does on its own after a disk-full or I/O error.
+            request.connection.execute("ROLLBACK")
+            raise RuntimeError("probe failed after the transaction ended")
+        return server.json(HTTPStatus.OK, {"done": True})
+
+    monkeypatch.setitem(
+        api._ROUTES, "/probe", api._Route("POST", api._Access.OPERATOR, handle)
+    )
+    return seen
+
+
+def test_a_mutation_runs_under_the_writer_lock_and_commits(
+    client: httpx.Client, store: sqlite3.Connection, probe: list[object]
+) -> None:
+    response = client.post("/probe", json={"x": 1}, headers=operator(BOB_TOKEN))
+
+    assert response.status_code == 200
+    assert response.json() == {"environment": "staging", "done": True}
+    assert probe == [{"x": 1}]
+    assert audit_rows(store) == [("bob", "probe", {})]
+
+
+def test_a_refused_mutation_writes_nothing(
+    client: httpx.Client, store: sqlite3.Connection, probe: list[object]
+) -> None:
+    response = client.post("/probe", json={"fail": True}, headers=operator())
+
+    assert response.status_code == 404
+    assert audit_rows(store) == []
+
+
+def test_a_failed_mutation_writes_nothing_and_releases_the_lock(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    probe: list[object],
+) -> None:
+    response = client.post("/probe", json={"raise": True}, headers=operator())
+
+    assert response.status_code == 500
+    assert response.json()["environment"] == "staging"
+    assert audit_rows(store) == []
+    assert not worker.writer_lock.locked()
+
+
+def test_a_mutation_whose_transaction_already_ended_logs_its_own_error(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    probe: list[object],
+    logs: pytest.LogCaptureFixture,
+) -> None:
+    response = client.post("/probe", json={"abort": True}, headers=operator())
+
+    assert response.status_code == 500
+    assert "probe failed after the transaction ended" in logs.text
+    assert "no transaction is active" not in logs.text
+    assert audit_rows(store) == []
+    assert not worker.writer_lock.locked()
+
+
+def test_a_mutation_while_a_pass_holds_the_lock_is_refused(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    probe: list[object],
+) -> None:
+    with worker.writer_lock:
+        response = client.post("/probe", json={}, headers=operator())
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["environment"] == "staging"
+    assert "pass" in body["error"]
+    assert "retry" in body["error"]
+    assert probe == []
+    assert audit_rows(store) == []
+
+
+def test_a_mutation_waits_for_a_pass_that_ends_within_the_bound(
+    client: httpx.Client, worker: FakeWorker, probe: list[object]
+) -> None:
+    worker.writer_lock.acquire()
+    wait = WRITER_LOCK_TIMEOUT_SECONDS / 10
+    release = threading.Timer(wait, worker.writer_lock.release)
+    release.start()
+    try:
+        response = client.post("/probe", json={}, headers=operator())
+    finally:
+        release.join()
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        (b"{not json", "JSON"),
+        (b"\xff\xfe", "JSON"),
+        (b"[1, 2]", "object"),
+        (b"", "object"),
+    ],
+)
+def test_a_body_that_is_not_a_json_object_is_a_bad_request(
+    client: httpx.Client, probe: list[object], content: bytes, reason: str
+) -> None:
+    response = client.post("/probe", content=content, headers=operator())
+
+    assert response.status_code == 400
+    assert response.json()["environment"] == "staging"
+    assert reason in response.json()["error"]
+    assert probe == []
+
+
+def test_a_body_nested_too_deep_to_parse_is_a_bad_request(
+    client: httpx.Client, probe: list[object]
+) -> None:
+    # As deep as fits within the limit: far past the parser's recursion limit.
+    depth = MAX_BODY_BYTES // 2
+    content = b"[" * depth + b"]" * depth
+
+    response = client.post("/probe", content=content, headers=operator())
+
+    assert response.status_code == 400
+    assert "JSON" in response.json()["error"]
+    assert probe == []
+
+
+def test_a_body_past_the_limit_is_refused(
+    client: httpx.Client, probe: list[object]
+) -> None:
+    content = b" " * (MAX_BODY_BYTES + 1)
+
+    response = client.post("/probe", content=content, headers=operator())
+
+    assert response.status_code == 413
+    assert response.json()["environment"] == "staging"
+    assert probe == []
+
+
+@pytest.mark.parametrize("length", ["many", "-1"])
+def test_a_bad_content_length_is_a_bad_request(
+    server: ApiServer, probe: list[object], length: str
+) -> None:
+    request = (
+        "POST /probe HTTP/1.1\r\n"
+        f"{AUTH_HEADER}: Bearer {ALICE_TOKEN}\r\n"
+        f"{ENVIRONMENT_HEADER}: staging\r\n"
+        f"Content-Length: {length}\r\n\r\n"
+    )
+    with socket.create_connection(("127.0.0.1", server.port), timeout=5) as raw:
+        raw.sendall(request.encode())
+        answer = raw.recv(4096)
+
+    assert answer.startswith(b"HTTP/1.0 400")
+    assert probe == []
+
+
+MUTATIONS = {
+    "/dry-run": {"on": False},
+    "/bindings/accept-sku-change": {"variant": VARIANT, "sku": "TEST-SKU-001-NEW"},
+}
+
+
+@pytest.mark.parametrize("path", MUTATIONS)
+def test_a_mutation_takes_an_operator_token_for_this_environment(
+    client: httpx.Client, store: sqlite3.Connection, path: str
+) -> None:
+    def status(headers: dict[str, str]) -> int:
+        return client.post(path, json=MUTATIONS[path], headers=headers).status_code
+
+    assert status({}) == 401
+    assert status(operator(METRICS_TOKEN)) == 401
+    assert status(operator(environment=Environment.PRODUCTION)) == 409
+    assert status(bearer(ALICE_TOKEN)) == 409
+    assert audit_rows(store) == []
+
+
+def test_a_mutation_endpoint_refuses_get(
+    client: httpx.Client, probe: list[object]
+) -> None:
+    response = client.get("/probe", headers=operator())
+
+    assert response.status_code == 405
+    assert response.headers["allow"] == "POST"
+
+
+def test_turning_dry_run_off_is_audited_with_the_operators_name(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    response = client.post("/dry-run", json={"on": False}, headers=operator())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "environment": "staging",
+        "dry_run": False,
+        "changed": True,
+    }
+    assert audit_rows(store) == [("alice", "dry-run", {"old": True, "new": False})]
+    assert client.get("/status", headers=operator()).json()["dry_run"] is False
+
+
+def test_turning_dry_run_back_on_is_audited(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    set_dry_run(store, False)
+
+    response = client.post("/dry-run", json={"on": True}, headers=operator(BOB_TOKEN))
+
+    assert response.json()["dry_run"] is True
+    assert audit_rows(store) == [("bob", "dry-run", {"old": False, "new": True})]
+
+
+def test_dry_run_is_set_while_a_pass_holds_the_lock(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    with worker.writer_lock:
+        response = client.post("/dry-run", json={"on": False}, headers=operator())
+
+    assert response.status_code == 200
+    assert dry_run(store) is False
+    assert audit_rows(store) == [("alice", "dry-run", {"old": True, "new": False})]
+
+
+def test_setting_dry_run_to_its_state_changes_and_audits_nothing(
+    client: httpx.Client, store: sqlite3.Connection
+) -> None:
+    response = client.post("/dry-run", json={"on": True}, headers=operator())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "environment": "staging",
+        "dry_run": True,
+        "changed": False,
+    }
+    assert audit_rows(store) == []
+
+
+@pytest.mark.parametrize("body", [{}, {"on": "off"}, {"on": 0}, {"on": None}])
+def test_dry_run_needs_a_boolean(
+    client: httpx.Client, store: sqlite3.Connection, body: dict[str, object]
+) -> None:
+    response = client.post("/dry-run", json=body, headers=operator())
+
+    assert response.status_code == 400
+    assert response.json()["environment"] == "staging"
+    assert "on" in response.json()["error"]
+    assert audit_rows(store) == []
+
+
+def accept_sku_change(
+    client: httpx.Client,
+    variant_id: str,
+    sku: str = "TEST-SKU-001-NEW",
+    token: str = ALICE_TOKEN,
+) -> httpx.Response:
+    return client.post(
+        "/bindings/accept-sku-change",
+        json={"variant": variant_id, "sku": sku},
+        headers=operator(token),
+    )
+
+
+def test_accepting_a_sku_change_records_the_sku_and_asks_for_a_full_pass(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+    hold_sku_change(store, OTHER_VARIANT, "TEST-ITEM-002", "TEST-SKU-002-NEW")
+
+    response = accept_sku_change(client, VARIANT, token=BOB_TOKEN)
+
+    accepted = {
+        "variant_id": VARIANT,
+        "bound_item_code": "TEST-ITEM-001",
+        "accepted_sku": "TEST-SKU-001-NEW",
+    }
+    assert response.status_code == 200
+    assert response.json() == {"environment": "staging"} | accepted
+    bindings = client.get("/bindings", headers=operator()).json()
+    assert [(c["variant_id"], c["accepted_sku"]) for c in bindings["sku_changes"]] == [
+        (VARIANT, "TEST-SKU-001-NEW"),
+        (OTHER_VARIANT, None),
+    ]
+    assert audit_rows(store) == [("bob", "accept-sku-change", accepted)]
+    assert worker.full_passes_requested == 1
+
+
+def test_accepting_a_sku_other_than_the_recorded_one_is_a_conflict(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEWER")
+
+    response = accept_sku_change(client, VARIANT, "TEST-SKU-001-NEW")
+
+    assert response.status_code == 409
+    assert response.json()["environment"] == "staging"
+    error = response.json()["error"]
+    assert "TEST-SKU-001-NEWER" in error
+    assert "TEST-SKU-001-NEW" in error.replace("TEST-SKU-001-NEWER", "")
+    assert "bindings" in error
+    assert audit_rows(store) == []
+    assert load_accepted(store) == {}
+    assert worker.full_passes_requested == 0
+
+
+def test_accepting_a_sku_change_while_a_pass_holds_the_lock_is_refused(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+
+    with worker.writer_lock:
+        response = accept_sku_change(client, VARIANT)
+
+    assert response.status_code == 503
+    assert audit_rows(store) == []
+    assert load_accepted(store) == {}
+    assert worker.full_passes_requested == 0
+
+
+def test_a_mutation_outwaits_one_upstream_attempt() -> None:
+    assert api.WRITER_LOCK_TIMEOUT_SECONDS > READ_TIMEOUT_SECONDS
+
+
+def hold_without_problem(store: sqlite3.Connection) -> None:
+    store.execute(
+        "INSERT INTO sku_changes (variant_id, bound_item_code, detected_at)"
+        " VALUES (?, 'TEST-ITEM-001', ?)",
+        (VARIANT, utc_timestamp(NOW)),
+    )
+
+
+def hold_with_resolved_problem(store: sqlite3.Connection) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+    record_check(store, ProblemKind.CHANGED_SKU, [], NOW, checked={VARIANT})
+
+
+def hold_with_sku(sku: str) -> Callable[[sqlite3.Connection], None]:
+    def hold(store: sqlite3.Connection) -> None:
+        hold_sku_change(store, VARIANT, "TEST-ITEM-001", sku)
+
+    return hold
+
+
+@pytest.mark.parametrize(
+    ("hold", "message"),
+    [
+        (hold_without_problem, "retry after the next full pass"),
+        (hold_with_resolved_problem, "retry after the next full pass"),
+        (hold_with_sku(NO_SKU), "no SKU in Shopify"),
+        (hold_with_sku(" \t"), "no SKU in Shopify"),
+    ],
+    ids=["no problem", "resolved problem", "no SKU", "blank SKU"],
+)
+def test_accepting_a_sku_change_with_no_sku_to_accept_is_a_conflict(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    hold: Callable[[sqlite3.Connection], None],
+    message: str,
+) -> None:
+    hold(store)
+
+    response = accept_sku_change(client, VARIANT)
+
+    assert response.status_code == 409
+    assert response.json()["environment"] == "staging"
+    assert message in response.json()["error"]
+    assert audit_rows(store) == []
+    assert worker.full_passes_requested == 0
+    assert load_accepted(store) == {}
+
+
+def test_accepting_a_sku_change_on_a_variant_without_one_changes_nothing(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    hold_sku_change(store, OTHER_VARIANT, "TEST-ITEM-002", "TEST-SKU-002-NEW")
+
+    response = accept_sku_change(client, VARIANT)
+
+    assert response.status_code == 404
+    assert response.json()["environment"] == "staging"
+    assert VARIANT in response.json()["error"]
+    assert audit_rows(store) == []
+    assert worker.full_passes_requested == 0
+    assert store.execute("SELECT count(*) FROM sku_changes").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("body", "field"),
+    [
+        ({"sku": "TEST-SKU-001-NEW"}, "variant"),
+        ({"variant": 1001, "sku": "TEST-SKU-001-NEW"}, "variant"),
+        ({"variant": "", "sku": "TEST-SKU-001-NEW"}, "variant"),
+        ({"variant": VARIANT}, "sku"),
+        ({"variant": VARIANT, "sku": 1}, "sku"),
+        ({"variant": VARIANT, "sku": ""}, "sku"),
+    ],
+)
+def test_accepting_a_sku_change_needs_a_variant_and_a_sku(
+    client: httpx.Client,
+    store: sqlite3.Connection,
+    worker: FakeWorker,
+    body: dict[str, object],
+    field: str,
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+
+    response = client.post("/bindings/accept-sku-change", json=body, headers=operator())
+
+    assert response.status_code == 400
+    assert f"'{field}'" in response.json()["error"]
+    assert audit_rows(store) == []
+    assert load_accepted(store) == {}
+    assert worker.full_passes_requested == 0

@@ -1,6 +1,8 @@
 """Shared test configuration: placeholder hosts, addresses and secrets."""
 
-from datetime import timedelta
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from shopify_erpnext_connector.config import (
@@ -57,3 +59,17 @@ def make_config(
             operator_tokens={},
         ),
     )
+
+
+@dataclass
+class FakeWorker:
+    """The worker state the API reads, set by hand."""
+
+    last_pass_at: datetime | None = None
+    last_pass_full: bool = False
+    last_full_pass_at: datetime | None = None
+    writer_lock: threading.Lock = field(default_factory=threading.Lock)
+    full_passes_requested: int = 0
+
+    def request_full_pass(self) -> None:
+        self.full_passes_requested += 1
