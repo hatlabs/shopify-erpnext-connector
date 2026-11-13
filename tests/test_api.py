@@ -35,6 +35,7 @@ OTHER_VARIANT = "gid://shopify/ProductVariant/1002"
 class FakeWorker:
     last_pass_at: datetime | None = None
     last_pass_full: bool = False
+    last_full_pass_at: datetime | None = None
 
 
 class Clock:
@@ -215,6 +216,7 @@ def test_status_before_the_first_pass(client: httpx.Client) -> None:
         "dry_run": True,
         "last_pass_at": None,
         "last_pass_full": False,
+        "last_full_pass_at": None,
         "push_lag_seconds": 0,
         "open_problems": 0,
         "unsent_emails": 0,
@@ -226,6 +228,7 @@ def test_status_reports_the_worker_and_the_store(
 ) -> None:
     worker.last_pass_at = NOW - timedelta(seconds=3)
     worker.last_pass_full = True
+    worker.last_full_pass_at = NOW - timedelta(hours=1)
     set_dry_run(store, False)
     record_check(
         store,
@@ -245,6 +248,7 @@ def test_status_reports_the_worker_and_the_store(
     assert body["dry_run"] is False
     assert body["last_pass_at"] == utc_timestamp(NOW - timedelta(seconds=3))
     assert body["last_pass_full"] is True
+    assert body["last_full_pass_at"] == utc_timestamp(NOW - timedelta(hours=1))
     assert body["open_problems"] == 2
     assert body["unsent_emails"] == 1
 
@@ -336,6 +340,7 @@ def test_metrics_before_the_first_pass(client: httpx.Client) -> None:
         'connector_info{environment="staging"}': 1,
         "connector_last_pass_timestamp_seconds": 0,
         "connector_last_pass_full": 0,
+        "connector_last_full_pass_timestamp_seconds": 0,
         "connector_pass_stale": 0,
         "connector_push_lag_seconds": 0,
         **{f'connector_open_problems{{kind="{kind}"}}': 0 for kind in ProblemKind},
@@ -368,6 +373,22 @@ def test_metrics_report_the_last_pass(client: httpx.Client, worker: FakeWorker) 
     )
     assert samples["connector_last_pass_full"] == 1
     assert samples["connector_pass_stale"] == 0
+
+
+def test_metrics_report_the_last_full_pass(
+    client: httpx.Client, worker: FakeWorker
+) -> None:
+    worker.last_pass_at = NOW - timedelta(seconds=2)
+    worker.last_full_pass_at = NOW - timedelta(hours=3)
+
+    samples = metrics(client)
+
+    assert samples["connector_last_full_pass_timestamp_seconds"] == (
+        (NOW - timedelta(hours=3)).timestamp()
+    )
+    assert samples["connector_last_pass_timestamp_seconds"] == (
+        (NOW - timedelta(seconds=2)).timestamp()
+    )
 
 
 def test_pass_is_stale_when_none_completed_within_the_threshold_of_start(

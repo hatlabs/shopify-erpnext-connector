@@ -66,6 +66,9 @@ class WorkerState(Protocol):
     @property
     def last_pass_full(self) -> bool: ...
 
+    @property
+    def last_full_pass_at(self) -> datetime | None: ...
+
 
 def audit(
     connection: sqlite3.Connection,
@@ -203,6 +206,7 @@ class ApiServer:
     def status(self, request: _Request) -> _Response:
         connection = request.connection
         last_pass_at = self._worker.last_pass_at
+        last_full_pass_at = self._worker.last_full_pass_at
         return self.json(
             HTTPStatus.OK,
             {
@@ -211,6 +215,11 @@ class ApiServer:
                     None if last_pass_at is None else utc_timestamp(last_pass_at)
                 ),
                 "last_pass_full": self._worker.last_pass_full,
+                "last_full_pass_at": (
+                    None
+                    if last_full_pass_at is None
+                    else utc_timestamp(last_full_pass_at)
+                ),
                 "push_lag_seconds": self._push_lag(connection),
                 "open_problems": sum(count_open_problems(connection).values()),
                 "unsent_emails": count_unsent_emails(connection),
@@ -221,6 +230,7 @@ class ApiServer:
         connection = request.connection
         now = self._clock()
         last_pass_at = self._worker.last_pass_at
+        last_full_pass_at = self._worker.last_full_pass_at
         stale_since = self._started_at if last_pass_at is None else last_pass_at
         gauges = [
             _Gauge(
@@ -237,6 +247,12 @@ class ApiServer:
                 "connector_last_pass_full",
                 "1 if the last completed pass was a full pass, else 0.",
                 {"": int(self._worker.last_pass_full)},
+            ),
+            _Gauge(
+                "connector_last_full_pass_timestamp_seconds",
+                "Start of the last completed full pass, in Unix time; "
+                "0 before the first.",
+                {"": 0 if last_full_pass_at is None else last_full_pass_at.timestamp()},
             ),
             _Gauge(
                 "connector_pass_stale",

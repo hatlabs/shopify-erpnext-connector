@@ -221,6 +221,11 @@ class Worker:
     def last_pass_full(self) -> bool:
         return self._last_pass_full
 
+    @property
+    def last_full_pass_at(self) -> datetime | None:
+        """When the last full pass that completed started; None before the first."""
+        return self._last_full_pass_at
+
     def run(self, stop: threading.Event) -> None:
         interval = self._config.worker.poll_interval.total_seconds()
         while not stop.is_set():
