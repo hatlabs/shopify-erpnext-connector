@@ -41,6 +41,14 @@ class Decision:
 
 
 @dataclass(frozen=True)
+class DatedDecision:
+    """A decision and when the pass that made it ran."""
+
+    decided_at: str
+    decision: Decision
+
+
+@dataclass(frozen=True)
 class ReportRow:
     """One bound variant in the cutover dry-run comparison."""
 
@@ -73,10 +81,18 @@ def save_decisions(
 
 
 def load_decision(connection: sqlite3.Connection, variant_id: str) -> Decision | None:
+    dated = load_dated_decision(connection, variant_id)
+    return None if dated is None else dated.decision
+
+
+def load_dated_decision(
+    connection: sqlite3.Connection, variant_id: str
+) -> DatedDecision | None:
     row = connection.execute(
-        "SELECT record FROM decisions WHERE variant_id = ?", (variant_id,)
+        "SELECT decided_at, record FROM decisions WHERE variant_id = ?",
+        (variant_id,),
     ).fetchone()
-    return None if row is None else _decode(row[0])
+    return None if row is None else DatedDecision(row[0], _decode(row[1]))
 
 
 def comparison_report(connection: sqlite3.Connection) -> list[ReportRow]:

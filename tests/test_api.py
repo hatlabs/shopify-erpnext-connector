@@ -766,6 +766,7 @@ def test_record_explains_a_bound_variant_with_its_push_history(
         "last_pushed": 2,
         "action": "pushed",
         "note": None,
+        "decided_at": utc_timestamp(NOW),
     }
     assert body["push_history"] == [
         {
@@ -836,6 +837,7 @@ def test_record_for_a_held_variant_keeps_its_last_decision(
     assert body["bound_item_code"] is None
     assert body["binding_problem"]["kind"] == "changed_sku"
     assert body["decision"]["item_code"] == "TEST-ITEM-001"
+    assert body["decision"]["decided_at"] == utc_timestamp(NOW)
 
 
 def resolve_unbound(store: sqlite3.Connection, variant_id: str) -> None:

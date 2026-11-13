@@ -49,7 +49,7 @@ CONNECTOR_PRODUCTION_TOKEN_FILE=/path/to/production-operator-token
 | `problems` | the open problems |
 | `problems show <kind:subject>` | one problem, its details and email state; problem emails name this command with the connector's `--env` |
 | `bindings` | unbound and ambiguous variants, and variants held after their SKU changed |
-| `record <variant GID>` | a variant's binding, the explanation of its sellable stock and its recent pushes |
+| `record <variant GID>` | a variant's binding, the explanation of its sellable stock and when it was computed, and its recent pushes |
 | `report` | the cutover dry-run comparison of computed and current Shopify values |
 
 `--json` prints the API's JSON answer instead of text.

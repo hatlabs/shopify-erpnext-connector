@@ -322,6 +322,7 @@ def _decision_lines(document: JsonObject) -> list[str]:
     lines = [
         f"Last decision: item {decision.get('item_code')},"
         f" action {decision.get('action')}",
+        f"  Decided at: {_field(decision, 'decided_at', str)}",
         *(f"  {name}: {_quantity(value)}" for name, value in explanation.items()),
         f"  Shopify available: {_quantity(decision.get('shopify_available'))}",
         f"  Last pushed: {_quantity(decision.get('last_pushed'))}",

@@ -830,6 +830,7 @@ def test_record_explains_a_bound_variant(
 
     assert code == 0, err
     assert "Bound to: TEST-ITEM-001" in out
+    assert f"  Decided at: {utc_timestamp(NOW)}" in out.splitlines()
     assert "sellable: 3" in out
     assert "reserved_qty: 1" in out
     assert "Shopify available: 2" in out

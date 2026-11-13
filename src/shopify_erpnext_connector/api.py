@@ -36,7 +36,10 @@ from urllib.parse import parse_qsl, urlsplit
 
 from shopify_erpnext_connector.bindings import bound_item_code, load_sku_changes
 from shopify_erpnext_connector.config import Config
-from shopify_erpnext_connector.decisions import comparison_report, load_decision
+from shopify_erpnext_connector.decisions import (
+    comparison_report,
+    load_dated_decision,
+)
 from shopify_erpnext_connector.problems import (
     ProblemKind,
     StoredProblem,
@@ -307,7 +310,7 @@ class ApiServer:
             ),
             None,
         )
-        decision = load_decision(connection, variant_id)
+        decision = load_dated_decision(connection, variant_id)
         history = recent_pushes(connection, variant_id, RECORD_PUSH_HISTORY)
         known = item_code or binding_problem or decision or history
         if not known:
@@ -322,7 +325,11 @@ class ApiServer:
                 "binding_problem": (
                     None if binding_problem is None else _problem_json(binding_problem)
                 ),
-                "decision": None if decision is None else asdict(decision),
+                "decision": (
+                    None
+                    if decision is None
+                    else asdict(decision.decision) | {"decided_at": decision.decided_at}
+                ),
                 "push_history": [asdict(attempt) for attempt in history],
             },
         )
