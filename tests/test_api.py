@@ -29,7 +29,13 @@ from shopify_erpnext_connector.decisions import Decision, save_decisions
 from shopify_erpnext_connector.poller import mark_dirty
 from shopify_erpnext_connector.problems import Problem, ProblemKind, record_check
 from shopify_erpnext_connector.push import PushOutcome
-from shopify_erpnext_connector.store import open_store, set_dry_run, utc_timestamp
+from shopify_erpnext_connector.retry import READ_TIMEOUT_SECONDS
+from shopify_erpnext_connector.store import (
+    dry_run,
+    open_store,
+    set_dry_run,
+    utc_timestamp,
+)
 from shopify_erpnext_connector.worker import NO_SKU
 
 NOW = datetime(2026, 11, 13, 10, 0, tzinfo=UTC)
@@ -1180,6 +1186,17 @@ def test_turning_dry_run_back_on_is_audited(
     assert audit_rows(store) == [("bob", "dry-run", {"old": False, "new": True})]
 
 
+def test_dry_run_is_set_while_a_pass_holds_the_lock(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    with worker.writer_lock:
+        response = client.post("/dry-run", json={"on": False}, headers=operator())
+
+    assert response.status_code == 200
+    assert dry_run(store) is False
+    assert audit_rows(store) == [("alice", "dry-run", {"old": True, "new": False})]
+
+
 def test_setting_dry_run_to_its_state_changes_and_audits_nothing(
     client: httpx.Client, store: sqlite3.Connection
 ) -> None:
@@ -1238,6 +1255,24 @@ def test_accepting_a_sku_change_records_the_sku_and_asks_for_a_full_pass(
     ]
     assert audit_rows(store) == [("bob", "accept-sku-change", accepted)]
     assert worker.full_passes_requested == 1
+
+
+def test_accepting_a_sku_change_while_a_pass_holds_the_lock_is_refused(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+
+    with worker.writer_lock:
+        response = accept_sku_change(client, VARIANT)
+
+    assert response.status_code == 503
+    assert audit_rows(store) == []
+    assert load_accepted(store) == {}
+    assert worker.full_passes_requested == 0
+
+
+def test_a_mutation_outwaits_one_upstream_call() -> None:
+    assert api.WRITER_LOCK_TIMEOUT_SECONDS > READ_TIMEOUT_SECONDS
 
 
 def test_accepting_a_sku_change_without_a_recorded_sku_is_a_conflict(

@@ -10,7 +10,8 @@ the bindings and recomputes every bound variant, so a missed change or an
 edit made in Shopify is corrected within the hour.
 
 The whole pass holds the writer lock, so a CLI mutation never interleaves
-with a pass's reads and writes. A failed read ends the pass with the dirty
+with a pass's reads and writes. Dry-run is read once at the start of a pass,
+so setting it needs no lock. A failed read ends the pass with the dirty
 items kept for the next one; the push staleness check and problem emails
 still run, since a Shopify outage is what the staleness check reports. A
 bound item dirty past the threshold is reported as well as a queued value,

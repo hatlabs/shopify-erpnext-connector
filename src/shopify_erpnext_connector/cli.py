@@ -439,11 +439,16 @@ def _render_report(document: JsonObject) -> str:
 
 def _render_dry_run(document: JsonObject) -> str:
     on = _field(document, "dry_run", bool)
-    if _field(document, "changed", bool):
-        state = f"Dry run: {_on_off(on)}, was {_on_off(not on)}"
-    else:
+    if not _field(document, "changed", bool):
         state = f"Dry run: already {_on_off(on)}; nothing changed"
-    return "\n".join([_environment_line(document), state])
+        return "\n".join([_environment_line(document), state])
+    return "\n".join(
+        [
+            _environment_line(document),
+            f"Dry run: {_on_off(on)}, was {_on_off(not on)}",
+            "This takes effect from the next pass.",
+        ]
+    )
 
 
 def _render_accepted_sku_change(document: JsonObject) -> str:
@@ -544,7 +549,7 @@ def _parser() -> argparse.ArgumentParser:
         "report", parents=[common], help="the cutover dry-run comparison"
     ).set_defaults(call=_Read("/report", _render_report))
     dry_run = commands.add_parser(
-        "dry-run", parents=[common], help="turn dry-run on or off"
+        "dry-run", parents=[common], help="turn dry-run on or off from the next pass"
     )
     dry_run.add_argument("state", choices=[_ON, _OFF])
     dry_run.set_defaults(

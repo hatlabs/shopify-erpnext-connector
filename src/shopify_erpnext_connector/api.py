@@ -12,10 +12,13 @@ to the thread that made them, and the store's WAL mode lets them read while
 the worker writes. Worker state is read through the worker's public
 properties only.
 
-Mutations are POST requests with a JSON object body. Each takes the worker's
-writer lock, waiting at most `writer_lock_timeout` for a running pass, and
-runs in one store transaction with its audit row; an answer of 400 or above
-rolls the transaction back, so a refused mutation leaves nothing behind.
+Mutations are POST requests with a JSON object body. Each runs in one store
+transaction with its audit row; an answer of 400 or above rolls the
+transaction back, so a refused mutation leaves nothing behind. A mutation of
+what a pass works on first takes the worker's writer lock, waiting at most
+`writer_lock_timeout` for a running pass. Dry-run does not: a pass reads it
+once at its start, so a change takes effect from the next pass and can be
+made while ERPNext or Shopify is slow.
 
 Request logs go through `logging` and never include headers, so a token is
 never logged.
@@ -61,6 +64,7 @@ from shopify_erpnext_connector.problems import (
     problem_key,
 )
 from shopify_erpnext_connector.push import recent_pushes, unpushed_since
+from shopify_erpnext_connector.retry import READ_TIMEOUT_SECONDS
 from shopify_erpnext_connector.store import dry_run, set_dry_run, utc_timestamp
 from shopify_erpnext_connector.worker import (
     BINDING_PROBLEM_KINDS,
@@ -83,8 +87,11 @@ SHUTDOWN_POLL_SECONDS = 0.1
 # A client that sends nothing for this long is disconnected, so a stalled
 # connection cannot hold a handler thread for good.
 REQUEST_TIMEOUT_SECONDS = 30.0
-# How long a mutation waits for a running pass to release the writer lock.
-WRITER_LOCK_TIMEOUT_SECONDS = 30.0
+# How long a mutation waits for a running pass to release the writer lock: a
+# pass holds it across upstream calls, so at least as long as one call can
+# take, with room for the connect and the pass's own work.
+WRITER_LOCK_MARGIN_SECONDS = 30.0
+WRITER_LOCK_TIMEOUT_SECONDS = READ_TIMEOUT_SECONDS + WRITER_LOCK_MARGIN_SECONDS
 # Request bodies hold a few identifiers; anything larger is refused unread.
 MAX_BODY_BYTES = 64 * 1024
 
@@ -173,6 +180,8 @@ class _Route:
     method: str
     access: _Access
     handle: Callable[["ApiServer", _Request], _Response]
+    # Whether a mutation waits for the worker's writer lock.
+    writer_lock: bool = True
 
 
 class ApiServer:
@@ -252,27 +261,32 @@ class ApiServer:
         return None
 
     def mutate(self, route: _Route, request: _Request) -> _Response:
-        """Run a mutation under the writer lock, in one transaction."""
+        """Run a mutation in one transaction, under the writer lock if it takes it."""
+        if not route.writer_lock:
+            return self._transact(route, request)
         lock = self._worker.writer_lock
         if not lock.acquire(timeout=self.writer_lock_timeout):
             return self.error(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 "a pass is running; retry the command in a moment",
             )
-        connection = request.connection
         try:
-            # IMMEDIATE: what the handler reads cannot change before it writes.
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                response = route.handle(self, request)
-            except BaseException:
-                connection.execute("ROLLBACK")
-                raise
-            refused = response.status >= HTTPStatus.BAD_REQUEST
-            connection.execute("ROLLBACK" if refused else "COMMIT")
-            return response
+            return self._transact(route, request)
         finally:
             lock.release()
+
+    def _transact(self, route: _Route, request: _Request) -> _Response:
+        connection = request.connection
+        # IMMEDIATE: what the handler reads cannot change before it writes.
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            response = route.handle(self, request)
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        refused = response.status >= HTTPStatus.BAD_REQUEST
+        connection.execute("ROLLBACK" if refused else "COMMIT")
+        return response
 
     def connect(self) -> sqlite3.Connection:
         # mode=rw: a missing store is an error, not a new empty database.
@@ -542,7 +556,9 @@ _ROUTES: Mapping[str, _Route] = {
     "/bindings": _Route("GET", _Access.OPERATOR, ApiServer.bindings),
     "/record": _Route("GET", _Access.OPERATOR, ApiServer.record),
     "/report": _Route("GET", _Access.OPERATOR, ApiServer.report),
-    "/dry-run": _Route("POST", _Access.OPERATOR, ApiServer.set_dry_run),
+    "/dry-run": _Route(
+        "POST", _Access.OPERATOR, ApiServer.set_dry_run, writer_lock=False
+    ),
     "/bindings/accept-sku-change": _Route(
         "POST", _Access.OPERATOR, ApiServer.accept_sku_change
     ),

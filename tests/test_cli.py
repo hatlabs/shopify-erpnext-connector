@@ -968,7 +968,11 @@ def test_dry_run_off_turns_it_off(
     code, out, err = run(capsys, "dry-run", "off")
 
     assert code == 0, err
-    assert out.splitlines() == ["Environment: staging", "Dry run: off, was on"]
+    assert out.splitlines() == [
+        "Environment: staging",
+        "Dry run: off, was on",
+        "This takes effect from the next pass.",
+    ]
     assert dry_run(store) is False
     assert audit_rows(store) == [("alice", "dry-run")]
 

@@ -26,7 +26,7 @@ The connector reads one non-secret TOML file and a directory holding one file pe
 
 The image runs as uid 10001, and Compose mounts secret files with their host owner and mode, so make them readable by that uid: `chown 10001 secrets/* && chmod 400 secrets/*`. The connector keeps its state in a SQLite store under `/var/lib/shopify-erpnext-connector`, a volume in the example. A new store starts in dry-run: the connector computes and records what it would push but writes nothing to Shopify until an operator turns dry-run off.
 
-The image runs the service with `shopify-erpnext-connector serve`. The same process serves an HTTP API on every interface, on port 8080 unless `[api] port` says otherwise. It speaks plain HTTP, so terminate TLS in front of it. The operator endpoints answer operators: each request carries an operator token as a bearer token and names the environment it expects in the `X-Connector-Environment` header, and a request for another environment is refused. `/status`, `/problems`, `/problem`, `/bindings`, `/record` and `/report` are `GET` reads. `/dry-run` and `/bindings/accept-sku-change` are `POST` mutations with a JSON object body; each waits up to 30 seconds for a running pass, answers 503 if the pass is still running, and records the operator's name in the audit log when it changes something. Two operators with the same token are refused at start, so the audit log names the right one, and so is an operator token equal to the metrics token. `GET /metrics` serves Prometheus gauges and takes only the metrics token.
+The image runs the service with `shopify-erpnext-connector serve`. The same process serves an HTTP API on every interface, on port 8080 unless `[api] port` says otherwise. It speaks plain HTTP, so terminate TLS in front of it. The operator endpoints answer operators: each request carries an operator token as a bearer token and names the environment it expects in the `X-Connector-Environment` header, and a request for another environment is refused. `/status`, `/problems`, `/problem`, `/bindings`, `/record` and `/report` are `GET` reads. `/dry-run` and `/bindings/accept-sku-change` are `POST` mutations with a JSON object body; each records the operator's name in the audit log when it changes something. `/bindings/accept-sku-change` waits up to 90 seconds for a running pass and answers 503 if the pass is still running. `/dry-run` does not wait: a pass reads the setting at its start, so a change takes effect from the next pass. Two operators with the same token are refused at start, so the audit log names the right one, and so is an operator token equal to the metrics token. `GET /metrics` serves Prometheus gauges and takes only the metrics token.
 
 ## Operator CLI
 
@@ -56,10 +56,10 @@ These commands change the connector:
 
 | Command | Does |
 |---|---|
-| `dry-run on` or `dry-run off` | turns dry-run on or off; turning it off makes the next pass a full one, which pushes every bound variant. Setting the state it already has changes nothing and says so |
+| `dry-run on` or `dry-run off` | turns dry-run on or off from the next pass, even while a pass is running; turning it off makes the next pass a full one, which pushes every bound variant. Setting the state it already has changes nothing and says so |
 | `bindings accept-sku-change <variant GID>` | accepts the new SKU that `bindings` shows for a variant held after its SKU changed: the next full pass binds the variant by that SKU if it still has it, and otherwise keeps it held and reports its newer SKU. A variant without a held change is reported as not found, and one with no new SKU recorded as a conflict |
 
-A command that changes production runs only with `--env production` on the command line; `CONNECTOR_ENV=production` alone is refused before the token is read. If a pass is running for longer than the connector waits, the command fails with a 503; run it again.
+A command that changes production runs only with `--env production` on the command line; `CONNECTOR_ENV=production` alone is refused before the token is read. If a pass runs for longer than the connector waits, `bindings accept-sku-change` fails with a 503; run it again.
 
 `--json` prints the API's JSON answer instead of text.
 
