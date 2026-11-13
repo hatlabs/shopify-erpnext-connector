@@ -376,6 +376,17 @@ def test_attempts_survive_a_restart(db_path: Path, erpnext: FakeErpNext) -> None
     second.close()
 
 
+def test_staging_email_command_asks_staging(
+    store: sqlite3.Connection, erpnext: FakeErpNext
+) -> None:
+    staging = make_config(environment=Environment.STAGING, email_enabled=True)
+
+    run_pass(store, erpnext, [unbound()], config=staging)
+
+    (call,) = erpnext.make_calls
+    assert SHOW_COMMAND.replace("production", "staging") in str(call["content"])
+
+
 def test_sending_disabled_records_the_problem_without_calling_erpnext(
     store: sqlite3.Connection, erpnext: FakeErpNext
 ) -> None:
