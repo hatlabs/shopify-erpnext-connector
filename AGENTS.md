@@ -30,3 +30,4 @@ The plan lives in the repo's GitHub issues: the parent plan issue and one issue 
 - Python 3.11, `src/` layout, strict typing with ty.
 - This repo is public. Never write real hostnames, domains, IP addresses, internal URLs or account names into it, including tests and examples. Use placeholders such as `example.myshopify.com` and `erpnext.example.com`.
 - Test fixtures are synthetic or scrubbed: placeholder hosts, no auth headers, no customer or address fields, only item codes and quantities. `./run check-fixtures` enforces part of this in CI.
+- Tests of the API's authentication send `Authorization` headers carrying placeholder tokens (`test-...`). They name the header through an `AUTH_HEADER` constant, which `./run check-fixtures` does not match; never put a real token in one.
