@@ -1422,6 +1422,8 @@ WAIT_SECONDS = 5.0
 # A sleep between passes that no passing test waits out, short enough that a
 # loop that fails to wake ends the test instead of hanging it.
 LONG_SLEEP = timedelta(seconds=10 * WAIT_SECONDS)
+# Many passes' time against the fakes: a loop that does not sleep runs one.
+NO_PASS_WINDOW_SECONDS = 0.5
 
 
 def request(worker: Worker, *, full: bool = False, items: Collection[str] = ()) -> int:
@@ -1493,6 +1495,22 @@ def test_stop_ends_the_loop_during_its_sleep(world: World) -> None:
 
     assert answered == [PassResult.COMPLETED]
     assert time.monotonic() - started < WAIT_SECONDS
+
+
+def test_the_loop_sleeps_its_interval_again_after_a_requested_pass(
+    world: World,
+) -> None:
+    worker = sleep_long(world)
+    answered: list[PassResult] = []
+
+    def client() -> None:
+        ticket = request(worker)
+        answered.append(worker.wait_for_pass(ticket, WAIT_SECONDS))
+        answered.append(worker.wait_for_pass(ticket + 1, NO_PASS_WINDOW_SECONDS))
+
+    run_alongside(worker, client)
+
+    assert answered == [PassResult.COMPLETED, PassResult.NOT_FINISHED]
 
 
 def test_a_pass_running_when_requested_does_not_answer_the_request(
