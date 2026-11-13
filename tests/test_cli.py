@@ -1337,6 +1337,45 @@ def test_push_all_reports_the_items_marked_and_left(
     assert audit_rows(store) == [("alice", "push")]
 
 
+@pytest.mark.parametrize(
+    ("left", "line"),
+    [
+        (0, "After the pass, none waits to be pushed."),
+        (2, "After the pass, 2 still wait to be pushed."),
+    ],
+)
+def test_push_all_reports_how_many_still_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    canned: tuple[Canned, str],
+    left: int,
+    line: str,
+) -> None:
+    state, url = canned
+    state.answer(
+        200,
+        {
+            "environment": "staging",
+            "all": True,
+            "item_count": 3,
+            "still_dirty": left,
+            "dry_run": False,
+            "pass": "completed",
+        },
+    )
+    configure(monkeypatch, tmp_path, url)
+
+    code, out, err = run(capsys, "push", "--all")
+
+    assert code == 0, err
+    assert out.splitlines() == [
+        "Environment: staging",
+        "Marked 3 bound items for a push.",
+        line,
+    ]
+
+
 @pytest.mark.usefixtures("connected")
 def test_push_as_json(
     store: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
