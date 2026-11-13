@@ -40,6 +40,7 @@ from typing import Protocol
 from urllib.parse import parse_qsl, urlsplit
 
 from shopify_erpnext_connector.bindings import (
+    accept_sku_change,
     bound_item_code,
     load_sku_change,
     load_sku_changes,
@@ -85,6 +86,7 @@ MAX_BODY_BYTES = 64 * 1024
 
 # Audit log action names; stable, so the log can be searched by them.
 DRY_RUN_ACTION = "dry-run"
+ACCEPT_SKU_CHANGE_ACTION = "accept-sku-change"
 
 _BEARER_SCHEME = "bearer"
 
@@ -107,6 +109,8 @@ class WorkerState(Protocol):
 
     @property
     def writer_lock(self) -> threading.Lock: ...
+
+    def request_full_pass(self) -> None: ...
 
 
 def audit(
@@ -405,6 +409,23 @@ class ApiServer:
             self.audit_mutation(request, DRY_RUN_ACTION, {"old": was, "new": on})
         return self.json(HTTPStatus.OK, {"dry_run": on, "changed": on != was})
 
+    def accept_sku_change(self, request: _Request) -> _Response:
+        variant_id = request.body.get("variant")
+        if not isinstance(variant_id, str) or not variant_id:
+            return self.error(
+                HTTPStatus.BAD_REQUEST, "the body needs 'variant' as a variant GID"
+            )
+        change = load_sku_change(request.connection, variant_id)
+        if change is None:
+            return self.error(
+                HTTPStatus.NOT_FOUND, f"variant {variant_id} has no held SKU change"
+            )
+        accept_sku_change(request.connection, variant_id)
+        detail = {"variant_id": variant_id, "bound_item_code": change.bound_item_code}
+        self.audit_mutation(request, ACCEPT_SKU_CHANGE_ACTION, detail)
+        self._worker.request_full_pass()
+        return self.json(HTTPStatus.OK, detail)
+
     def audit_mutation(
         self, request: _Request, action: str, detail: Mapping[str, object]
     ) -> None:
@@ -499,6 +520,9 @@ _ROUTES: Mapping[str, _Route] = {
     "/record": _Route("GET", _Access.OPERATOR, ApiServer.record),
     "/report": _Route("GET", _Access.OPERATOR, ApiServer.report),
     "/dry-run": _Route("POST", _Access.OPERATOR, ApiServer.set_dry_run),
+    "/bindings/accept-sku-change": _Route(
+        "POST", _Access.OPERATOR, ApiServer.accept_sku_change
+    ),
 }
 
 

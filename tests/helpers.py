@@ -69,3 +69,7 @@ class FakeWorker:
     last_pass_full: bool = False
     last_full_pass_at: datetime | None = None
     writer_lock: threading.Lock = field(default_factory=threading.Lock)
+    full_passes_requested: int = 0
+
+    def request_full_pass(self) -> None:
+        self.full_passes_requested += 1

@@ -304,6 +304,11 @@ def load_sku_change(
     return None if row is None else SkuChange(*row)
 
 
+def accept_sku_change(connection: sqlite3.Connection, variant_id: str) -> None:
+    """Drop the hold, so the next full pass binds the variant by its new SKU."""
+    connection.execute("DELETE FROM sku_changes WHERE variant_id = ?", (variant_id,))
+
+
 def save_bindings(
     connection: sqlite3.Connection, result: BindingResult, now: datetime
 ) -> None:

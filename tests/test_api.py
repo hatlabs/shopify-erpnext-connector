@@ -1121,7 +1121,10 @@ def test_a_bad_content_length_is_a_bad_request(
     assert probe == []
 
 
-MUTATIONS = {"/dry-run": {"on": False}}
+MUTATIONS = {
+    "/dry-run": {"on": False},
+    "/bindings/accept-sku-change": {"variant": VARIANT},
+}
 
 
 @pytest.mark.parametrize("path", MUTATIONS)
@@ -1197,3 +1200,65 @@ def test_dry_run_needs_a_boolean(
     assert response.json()["environment"] == "staging"
     assert "on" in response.json()["error"]
     assert audit_rows(store) == []
+
+
+def accept_sku_change(
+    client: httpx.Client, variant_id: str, token: str = ALICE_TOKEN
+) -> httpx.Response:
+    return client.post(
+        "/bindings/accept-sku-change",
+        json={"variant": variant_id},
+        headers=operator(token),
+    )
+
+
+def test_accepting_a_sku_change_removes_the_hold_and_asks_for_a_full_pass(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    hold_sku_change(store, VARIANT, "TEST-ITEM-001", "TEST-SKU-001-NEW")
+    hold_sku_change(store, OTHER_VARIANT, "TEST-ITEM-002", "TEST-SKU-002-NEW")
+
+    response = accept_sku_change(client, VARIANT, BOB_TOKEN)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "environment": "staging",
+        "variant_id": VARIANT,
+        "bound_item_code": "TEST-ITEM-001",
+    }
+    bindings = client.get("/bindings", headers=operator()).json()
+    assert [c["variant_id"] for c in bindings["sku_changes"]] == [OTHER_VARIANT]
+    assert audit_rows(store) == [
+        (
+            "bob",
+            "accept-sku-change",
+            {"variant_id": VARIANT, "bound_item_code": "TEST-ITEM-001"},
+        )
+    ]
+    assert worker.full_passes_requested == 1
+
+
+def test_accepting_a_sku_change_on_a_variant_without_one_changes_nothing(
+    client: httpx.Client, store: sqlite3.Connection, worker: FakeWorker
+) -> None:
+    hold_sku_change(store, OTHER_VARIANT, "TEST-ITEM-002", "TEST-SKU-002-NEW")
+
+    response = accept_sku_change(client, VARIANT)
+
+    assert response.status_code == 404
+    assert response.json()["environment"] == "staging"
+    assert VARIANT in response.json()["error"]
+    assert audit_rows(store) == []
+    assert worker.full_passes_requested == 0
+    assert store.execute("SELECT count(*) FROM sku_changes").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("body", [{}, {"variant": 1001}, {"variant": ""}])
+def test_accepting_a_sku_change_needs_a_variant(
+    client: httpx.Client, worker: FakeWorker, body: dict[str, object]
+) -> None:
+    response = client.post("/bindings/accept-sku-change", json=body, headers=operator())
+
+    assert response.status_code == 400
+    assert "variant" in response.json()["error"]
+    assert worker.full_passes_requested == 0

@@ -232,6 +232,10 @@ class Worker:
         """When the last full pass that completed started; None before the first."""
         return self._last_full_pass_at
 
+    def request_full_pass(self) -> None:
+        """Make the next pass a full one; call with `writer_lock` held."""
+        self._full_pass_requested = True
+
     def run(self, stop: threading.Event) -> None:
         interval = self._config.worker.poll_interval.total_seconds()
         while not stop.is_set():

@@ -1,6 +1,7 @@
 import json
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,7 +9,9 @@ import httpx
 import pytest
 from helpers import ERPNEXT_URL, LOCATION_ID, SHOP_DOMAIN, WAREHOUSE, make_config
 
-from shopify_erpnext_connector.config import Config
+from shopify_erpnext_connector.api import ENVIRONMENT_HEADER, ApiServer
+from shopify_erpnext_connector.bindings import bound_item_code
+from shopify_erpnext_connector.config import ApiConfig, Config, Secret
 from shopify_erpnext_connector.decisions import (
     Decision,
     ReportRow,
@@ -1030,6 +1033,18 @@ def test_a_full_pass_runs_at_start_and_then_hourly(world: World) -> None:
     assert world.worker.last_pass_at == NOW + FULL_PASS_INTERVAL
 
 
+def test_a_requested_full_pass_runs_next_and_once(world: World) -> None:
+    world.bind(1, actual=3, available=3)
+    world.worker.run_pass(NOW)
+
+    world.worker.request_full_pass()
+    world.worker.run_pass(NOW + SECOND)
+    assert (world.shopify.variant_reads, world.worker.last_pass_full) == (2, True)
+
+    world.worker.run_pass(NOW + 2 * SECOND)
+    assert (world.shopify.variant_reads, world.worker.last_pass_full) == (2, False)
+
+
 def test_last_full_pass_at_is_the_start_of_the_last_completed_full_pass(
     world: World,
 ) -> None:
@@ -1444,3 +1459,54 @@ def test_binding_problem_kinds_are_unbound_ambiguous_then_changed() -> None:
         ProblemKind.AMBIGUOUS_SKU,
         ProblemKind.CHANGED_SKU,
     )
+
+
+# Operator commands through the API
+
+
+OPERATOR_TOKEN = "test-operator-token"
+# Kept apart from its value so the fixture check's header pattern stays meaningful.
+AUTH_HEADER = "Authorization"
+
+
+def test_an_accepted_sku_change_binds_the_variant_to_its_new_sku_next_pass(
+    world: World,
+) -> None:
+    world.bind(9, actual=4, available=0)
+    world.worker.run_pass(NOW)
+    world.shopify.set_sku(9, item_code(10))
+    world.erpnext.add_item(item_code(10))
+    world.erpnext.set_bin(item_code(10), actual=2)
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL)
+    assert world.open_of(ProblemKind.CHANGED_SKU) == [variant_id(9)]
+    config = replace(
+        world.config,
+        store_path=world.path,
+        api=ApiConfig(port=0),
+        secrets=replace(
+            world.config.secrets, operator_tokens={"alice": Secret(OPERATOR_TOKEN)}
+        ),
+    )
+    server = ApiServer(config, world.worker)
+    server.start()
+    try:
+        response = httpx.post(
+            f"http://127.0.0.1:{server.port}/bindings/accept-sku-change",
+            json={"variant": variant_id(9)},
+            headers={
+                AUTH_HEADER: f"Bearer {OPERATOR_TOKEN}",
+                ENVIRONMENT_HEADER: world.config.environment,
+            },
+        )
+    finally:
+        server.close()
+    assert response.status_code == 200
+
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL + SECOND)
+
+    assert world.worker.last_pass_full
+    assert bound_item_code(world.store, variant_id(9)) == item_code(10)
+    assert world.open_of(ProblemKind.CHANGED_SKU) == []
+    assert world.shopify.available(9) == 2
+    operators = world.store.execute("SELECT operator FROM audit_log").fetchall()
+    assert operators == [("alice",)]
