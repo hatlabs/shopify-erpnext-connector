@@ -62,9 +62,9 @@ These commands change the connector:
 | `push --all` | the same for every bound variant; shows how many items were marked and how many still wait to be pushed after the pass, such as a failed or held push |
 | `rerun <kind:subject>` | runs a full pass now and shows whether the problem is still open or cleared. A pass in dry-run does not check stale pushes, so rerunning a `stale_push` problem in dry-run is refused as a conflict |
 
-`push` and `rerun` wait for the pass they ask for, up to two minutes. If it does not end in time, the command says so and exits 0: the request was accepted and the connector still runs the pass, so check `record` or `problems show` later. If the pass ended early, the command says the push may not have happened, or that the problem was not rechecked, and points to the connector's log and `status`.
+`push` and `rerun` wait for the pass they ask for, up to two minutes. If it does not end in time, the command says so and exits 0: the request was accepted and the connector still runs the pass, so check `record` or `problems show` later. If the pass ended early, the command says the push may not have happened, or that the problem may not have been rechecked, and points to the connector's log and `status`.
 
-A command that changes production runs only with `--env production` on the command line; `CONNECTOR_ENV=production` alone is refused before the token is read. If a pass runs for longer than the connector waits, `bindings accept-sku-change`, `push` and `rerun` fail with a 503; run the command again.
+A command that changes production runs only with `--env production` on the command line; `CONNECTOR_ENV=production` alone is refused before the token is read. If a running pass holds the connector for more than 90 seconds before the command can start, `bindings accept-sku-change`, `push` and `rerun` fail with a 503 and change nothing; run the command again. A requested pass that outlasts the two-minute wait is not a 503: the request was accepted, so check `record` or `problems show` rather than repeating it.
 
 `--json` prints the API's JSON answer instead of text.
 

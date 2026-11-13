@@ -531,7 +531,7 @@ def _render_rerun(document: JsonObject) -> str:
     lines = [_environment_line(document), f"Problem: {key}"]
     unfinished = _unfinished(
         document,
-        "The full pass ended early; the problem was not rechecked.",
+        "The full pass ended early; the problem may not have been rechecked.",
         f"Check `problems show {key}` later.",
     )
     if unfinished:

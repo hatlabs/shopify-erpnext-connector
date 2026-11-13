@@ -1470,7 +1470,7 @@ def test_a_pass_that_did_not_end_in_time_is_reported_as_pending(
         (
             ["rerun", f"unbound_sku:{VARIANT}"],
             {"key": f"unbound_sku:{VARIANT}", "problem": {"resolved_at": None}},
-            "The full pass ended early; the problem was not rechecked.",
+            "The full pass ended early; the problem may not have been rechecked.",
         ),
     ],
 )
