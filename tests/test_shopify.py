@@ -14,8 +14,10 @@ from shopify_erpnext_connector.shopify import (
     MAX_THROTTLE_RETRIES,
     ChangeFromQuantityStaleError,
     InventoryBatch,
+    LocationError,
     QuantityChange,
     ShopifyClient,
+    ShopifyError,
     ShopifyGraphQLError,
     ShopifyHTTPError,
     ShopifyTransportError,
@@ -599,3 +601,97 @@ def test_redirect_raises_without_following(status: int) -> None:
 
     assert excinfo.value.status == status
     assert [r.url.host for r in requests] == [SHOP_DOMAIN]
+
+
+ACCESS_DENIED: list[dict[str, object]] = [
+    {
+        "message": "Access denied for location field.",
+        "extensions": {"code": "ACCESS_DENIED"},
+        "path": ["location"],
+    }
+]
+
+
+def location_response(location: Mapping[str, object] | None) -> httpx.Response:
+    return graphql_response({"location": location})
+
+
+def active_location() -> httpx.Response:
+    return location_response({"id": LOCATION_ID, "isActive": True})
+
+
+def test_location_check_sends_the_pinned_location_as_a_variable() -> None:
+    recorder = Recorder(active_location())
+
+    make_client(recorder).check_location()
+
+    (body,) = recorder.bodies()
+    assert variables(body) == {"id": LOCATION_ID}
+    query = body["query"]
+    assert isinstance(query, str)
+    assert LOCATION_ID not in query
+    assert "isActive" in query
+
+
+def test_missing_location_raises_naming_the_location_and_shop() -> None:
+    with pytest.raises(LocationError) as raised:
+        make_client(Recorder(location_response(None))).check_location()
+
+    assert LOCATION_ID in str(raised.value)
+    assert SHOP_DOMAIN in str(raised.value)
+    assert "not found" in str(raised.value)
+
+
+def test_inactive_location_raises_naming_the_location_and_shop() -> None:
+    inactive = location_response({"id": LOCATION_ID, "isActive": False})
+
+    with pytest.raises(LocationError) as raised:
+        make_client(Recorder(inactive)).check_location()
+
+    assert LOCATION_ID in str(raised.value)
+    assert SHOP_DOMAIN in str(raised.value)
+    assert "not active" in str(raised.value)
+
+
+def test_access_denied_location_raises_naming_the_missing_scope() -> None:
+    denied = graphql_response({"location": None}, errors=ACCESS_DENIED)
+
+    with pytest.raises(LocationError, match="read_locations"):
+        make_client(Recorder(denied)).check_location()
+
+
+def test_location_check_retries_a_server_error_and_succeeds() -> None:
+    sleeps = Sleeps()
+    recorder = Recorder(httpx.Response(503), active_location())
+
+    make_client(recorder, sleep=sleeps).check_location()
+
+    assert len(recorder.requests) == 2
+    assert sleeps.calls == [RETRY_DELAY_SECONDS]
+
+
+def test_location_check_retries_throttling_and_succeeds() -> None:
+    recorder = Recorder(graphql_response(None, errors=THROTTLED), active_location())
+
+    make_client(recorder).check_location()
+
+    assert len(recorder.requests) == 2
+
+
+def test_location_check_raises_after_persistent_server_errors() -> None:
+    recorder = Recorder(*[httpx.Response(503) for _ in range(MAX_ATTEMPTS)])
+
+    with pytest.raises(ShopifyHTTPError) as raised:
+        make_client(recorder).check_location()
+
+    assert not isinstance(raised.value, LocationError)
+    assert len(recorder.requests) == MAX_ATTEMPTS
+
+
+def test_location_check_raises_on_an_unexpected_location_shape() -> None:
+    malformed = location_response({"id": LOCATION_ID})
+
+    with pytest.raises(ShopifyError) as raised:
+        make_client(Recorder(malformed)).check_location()
+
+    assert not isinstance(raised.value, LocationError)
