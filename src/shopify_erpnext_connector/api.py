@@ -135,6 +135,9 @@ class WorkerState(Protocol):
     def last_full_pass_at(self) -> datetime | None: ...
 
     @property
+    def last_backup_at(self) -> datetime | None: ...
+
+    @property
     def writer_lock(self) -> threading.Lock: ...
 
     def request_pass(
@@ -662,6 +665,7 @@ class ApiServer:
         now = self._clock()
         last_pass_at = self._worker.last_pass_at
         last_full_pass_at = self._worker.last_full_pass_at
+        last_backup_at = self._worker.last_backup_at
         stale_since = self._started_at if last_pass_at is None else last_pass_at
         gauges = [
             _Gauge(
@@ -715,6 +719,12 @@ class ApiServer:
                 "connector_dry_run",
                 "1 if the connector pushes nothing to Shopify, else 0.",
                 {"": int(dry_run(connection))},
+            ),
+            _Gauge(
+                "connector_last_backup_timestamp_seconds",
+                "When the newest store backup was taken, in Unix time; "
+                "0 if there is none.",
+                {"": 0 if last_backup_at is None else last_backup_at.timestamp()},
             ),
         ]
         text = "\n".join(gauge.render() for gauge in gauges) + "\n"
