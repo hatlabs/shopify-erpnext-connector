@@ -1,0 +1,33 @@
+# Example TLS edge for the connector's API. Copy next to compose.example.yaml
+# as Caddyfile and set CONNECTOR_HOST in the Compose environment.
+#
+# The certificate comes from files in ./certs (fullchain.pem, privkey.pem),
+# issued elsewhere. Caddy reads them at start and on `caddy reload`, so
+# whatever installs a renewed certificate must reload Caddy afterwards.
+{
+	# Only 443 is published; nothing answers plain HTTP.
+	auto_https disable_redirects
+
+	servers {
+		# The API's own socket timeout applies to each receive, not to a whole
+		# request, so a client trickling a request could hold a handler thread.
+		timeouts {
+			read_header 10s
+			read_body 30s
+			idle 2m
+		}
+	}
+}
+
+{$CONNECTOR_HOST} {
+	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+
+	# The API refuses bodies over 64 KiB; refuse them here before they reach it.
+	request_body {
+		max_size 64KiB
+	}
+
+	# No write timeout: /push and /rerun can wait up to four minutes before
+	# answering.
+	reverse_proxy connector:8080
+}

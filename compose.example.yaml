@@ -6,12 +6,18 @@
 #
 #   chown 10001 secrets/* && chmod 400 secrets/*
 #
-# The store lives in the `store` volume. The connector starts in dry-run, so
-# it pushes nothing to Shopify until an operator turns dry-run off.
+# The store lives in the `store` volume, and the connector writes a daily
+# backup of it to backups/ in the same volume. The connector starts in
+# dry-run, so it pushes nothing to Shopify until an operator turns dry-run off.
+#
+# Caddy terminates TLS in front of the API (see Caddyfile.example) and is the
+# only service that publishes a port; the connector publishes none.
 services:
   connector:
     image: ghcr.io/hatlabs/shopify-erpnext-connector:latest
     restart: unless-stopped
+    # A pass retrying a slow upstream can outlast Docker's default 10 s.
+    stop_grace_period: 2m
     volumes:
       - ./config.toml:/etc/shopify-erpnext-connector/config.toml:ro
       - store:/var/lib/shopify-erpnext-connector
@@ -21,6 +27,20 @@ services:
       - shopify_access_token
       - metrics_token
       - operator_token_alice
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - connector
+    ports:
+      - "443:443"
+    environment:
+      CONNECTOR_HOST: connector.example.com
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/etc/caddy/certs:ro
+      - caddy_data:/data
 
 secrets:
   erpnext_api_key:
@@ -36,3 +56,4 @@ secrets:
 
 volumes:
   store:
+  caddy_data:
