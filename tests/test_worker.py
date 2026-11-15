@@ -14,6 +14,7 @@ import httpx
 import pytest
 from helpers import ERPNEXT_URL, LOCATION_ID, SHOP_DOMAIN, WAREHOUSE, make_config
 
+from shopify_erpnext_connector import worker as worker_module
 from shopify_erpnext_connector.api import ENVIRONMENT_HEADER, ApiServer
 from shopify_erpnext_connector.backup import KEEP_BACKUPS, backup_directory
 from shopify_erpnext_connector.bindings import bound_item_code
@@ -1982,6 +1983,26 @@ def test_a_failed_backup_is_logged_and_retried_after_a_wait(
     blocker.unlink()
     world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL - SECOND)
     assert backups(world) == []
+    world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL)
+    assert len(backups(world)) == 1
+    assert world.worker.last_backup_at == NOW + BACKUP_RETRY_INTERVAL
+
+
+def test_a_backup_failing_in_sqlite_is_logged_and_retried_after_a_wait(
+    world: World, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def disk_full(*args: object) -> Path:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker_module, "take_backup", disk_full)
+        with caplog.at_level(logging.WARNING):
+            world.worker.back_up_if_due(NOW)
+        assert "database or disk is full" in caplog.text
+        assert world.worker.last_backup_at is None
+        world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL - SECOND)
+        assert caplog.text.count("database or disk is full") == 1
+
     world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL)
     assert len(backups(world)) == 1
     assert world.worker.last_backup_at == NOW + BACKUP_RETRY_INTERVAL
