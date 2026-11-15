@@ -219,6 +219,25 @@ def test_unusable_location_refuses_to_start_before_the_api_and_worker(
     assert runs == []
 
 
+def test_rejected_token_at_the_location_check_is_a_configuration_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    api_port: int,
+) -> None:
+    write_config(tmp_path, monkeypatch, tmp_path / "connector.sqlite3", api_port)
+    runs: list[Worker] = []
+    monkeypatch.setattr(Worker, "run", lambda self, stop: runs.append(self))
+    transport = httpx.MockTransport(lambda request: httpx.Response(401))
+
+    assert serve(threading.Event(), shopify_transport=transport) == os.EX_CONFIG
+
+    err = capsys.readouterr().err
+    assert f"Shopify rejected the access token for shop {SHOP_DOMAIN}" in err
+    assert "placeholder" not in err
+    assert runs == []
+
+
 def test_upstream_failure_at_the_location_check_exits_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -229,12 +248,12 @@ def test_upstream_failure_at_the_location_check_exits_unavailable(
     runs: list[Worker] = []
     monkeypatch.setattr(Worker, "run", lambda self, stop: runs.append(self))
     # Not retried, so the test does not wait out the retry backoff.
-    transport = httpx.MockTransport(lambda request: httpx.Response(401))
+    transport = httpx.MockTransport(lambda request: httpx.Response(404))
 
     assert serve(threading.Event(), shopify_transport=transport) == os.EX_UNAVAILABLE
 
     err = capsys.readouterr().err
-    assert "401" in err
+    assert "404" in err
     assert "placeholder" not in err
     assert runs == []
 

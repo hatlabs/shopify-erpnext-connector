@@ -230,6 +230,13 @@ class ShopifyClient:
                     "the read_locations scope"
                 ) from None
             raise
+        except ShopifyHTTPError as error:
+            if error.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+                raise LocationError(
+                    "Shopify rejected the access token for shop "
+                    f"{self._shop_domain} ({error.status})"
+                ) from None
+            raise
         location = data.get("location")
         if location is None:
             raise LocationError(f"{where} not found")

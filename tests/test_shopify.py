@@ -660,6 +660,18 @@ def test_access_denied_location_raises_naming_the_missing_scope() -> None:
         make_client(Recorder(denied)).check_location()
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_rejected_token_at_the_location_check_raises_naming_the_shop(
+    status: int,
+) -> None:
+    with pytest.raises(LocationError) as raised:
+        make_client(Recorder(httpx.Response(status))).check_location()
+
+    message = str(raised.value)
+    assert f"Shopify rejected the access token for shop {SHOP_DOMAIN}" in message
+    assert SHOPIFY_ACCESS_TOKEN not in message
+
+
 def test_location_check_retries_a_server_error_and_succeeds() -> None:
     sleeps = Sleeps()
     recorder = Recorder(httpx.Response(503), active_location())
