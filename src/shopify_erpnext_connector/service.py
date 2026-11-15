@@ -15,7 +15,11 @@ from shopify_erpnext_connector.retry import (
     CONNECT_TIMEOUT_SECONDS,
     READ_TIMEOUT_SECONDS,
 )
-from shopify_erpnext_connector.shopify import ShopifyClient
+from shopify_erpnext_connector.shopify import (
+    LocationError,
+    ShopifyClient,
+    ShopifyError,
+)
 from shopify_erpnext_connector.store import StoreError, open_store
 from shopify_erpnext_connector.worker import Worker
 
@@ -31,8 +35,15 @@ def install_stop_handlers(stop: threading.Event) -> None:
         signal.signal(signum, lambda _signum, _frame: stop.set())
 
 
-def serve(stop: threading.Event | None = None) -> int:
-    """Run the worker and the API until SIGTERM or SIGINT, or until `stop` is set."""
+def serve(
+    stop: threading.Event | None = None,
+    *,
+    shopify_transport: httpx.BaseTransport | None = None,
+) -> int:
+    """Run the worker and the API until SIGTERM or SIGINT, or until `stop` is set.
+
+    `shopify_transport` replaces the network transport to Shopify, for tests.
+    """
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
@@ -62,15 +73,23 @@ def serve(stop: threading.Event | None = None) -> int:
     try:
         with (
             httpx.Client(
-                base_url=f"https://{config.shop_domain}", timeout=timeout
+                base_url=f"https://{config.shop_domain}",
+                timeout=timeout,
+                transport=shopify_transport,
             ) as shopify_http,
             httpx.Client(base_url=config.erpnext_url, timeout=timeout) as erpnext_http,
         ):
+            shopify = ShopifyClient(config, shopify_http)
+            try:
+                shopify.check_location()
+            except LocationError as error:
+                print(f"configuration error: {error}", file=sys.stderr)
+                return os.EX_CONFIG
+            except ShopifyError as error:
+                print(f"cannot check the Shopify location: {error}", file=sys.stderr)
+                return os.EX_UNAVAILABLE
             worker = Worker(
-                config,
-                connection,
-                ShopifyClient(config, shopify_http),
-                ErpNextClient(config, erpnext_http),
+                config, connection, shopify, ErpNextClient(config, erpnext_http)
             )
             try:
                 api = ApiServer(config, worker)

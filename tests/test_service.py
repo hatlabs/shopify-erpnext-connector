@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from helpers import LOCATION_ID, SHOP_DOMAIN
 
 from shopify_erpnext_connector.api import ENVIRONMENT_HEADER
 from shopify_erpnext_connector.config import DEFAULT_API_PORT
@@ -24,6 +25,17 @@ SECRET_NAMES = [
 ]
 # Kept apart from its value so the fixture check's header pattern stays meaningful.
 AUTH_HEADER = "Authorization"
+
+
+def shopify_location(location: dict[str, object] | None) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"location": location}})
+
+    return httpx.MockTransport(handler)
+
+
+def active_location() -> httpx.MockTransport:
+    return shopify_location({"id": LOCATION_ID, "isActive": True})
 
 
 def stopped() -> threading.Event:
@@ -83,7 +95,7 @@ def test_valid_config_opens_the_store_and_reports_the_pinned_environment(
     store_path = tmp_path / "connector.sqlite3"
     write_config(tmp_path, monkeypatch, store_path, api_port)
 
-    assert serve(stopped()) == os.EX_OK
+    assert serve(stopped(), shopify_transport=active_location()) == os.EX_OK
 
     err = capsys.readouterr().err
     assert "staging" in err
@@ -126,7 +138,7 @@ def test_api_serves_while_the_worker_runs_and_stops_with_it(
 
     monkeypatch.setattr(Worker, "run", run)
 
-    assert serve(stopped()) == os.EX_OK
+    assert serve(stopped(), shopify_transport=active_location()) == os.EX_OK
 
     assert statuses == [200]
     with pytest.raises(httpx.ConnectError):
@@ -144,9 +156,87 @@ def test_api_port_in_use_exits_with_an_error(
         taken.bind(("", api_port))
         taken.listen()
 
-        assert serve(stopped()) == os.EX_OSERR
+        assert serve(stopped(), shopify_transport=active_location()) == os.EX_OSERR
 
     assert str(api_port) in capsys.readouterr().err
+
+
+def test_active_location_lets_the_worker_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api_port: int
+) -> None:
+    write_config(tmp_path, monkeypatch, tmp_path / "connector.sqlite3", api_port)
+    runs: list[Worker] = []
+    monkeypatch.setattr(Worker, "run", lambda self, stop: runs.append(self))
+
+    assert serve(stopped(), shopify_transport=active_location()) == os.EX_OK
+
+    assert len(runs) == 1
+
+
+DENIED = {
+    "data": {"location": None},
+    "errors": [
+        {
+            "message": "Access denied for location field.",
+            "extensions": {"code": "ACCESS_DENIED"},
+        }
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"data": {"location": None}}, [LOCATION_ID, SHOP_DOMAIN, "not found"]),
+        (
+            {"data": {"location": {"id": LOCATION_ID, "isActive": False}}},
+            [LOCATION_ID, SHOP_DOMAIN, "not active"],
+        ),
+        (DENIED, ["read_locations"]),
+    ],
+    ids=["missing", "inactive", "access-denied"],
+)
+def test_unusable_location_refuses_to_start_before_the_api_and_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    api_port: int,
+    body: dict[str, object],
+    expected: list[str],
+) -> None:
+    write_config(tmp_path, monkeypatch, tmp_path / "connector.sqlite3", api_port)
+    runs: list[Worker] = []
+    monkeypatch.setattr(Worker, "run", lambda self, stop: runs.append(self))
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=body))
+
+    # Not set: a refusal must return without the worker ever starting.
+    assert serve(threading.Event(), shopify_transport=transport) == os.EX_CONFIG
+
+    err = capsys.readouterr().err
+    for text in expected:
+        assert text in err
+    assert "placeholder" not in err
+    assert runs == []
+
+
+def test_upstream_failure_at_the_location_check_exits_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    api_port: int,
+) -> None:
+    write_config(tmp_path, monkeypatch, tmp_path / "connector.sqlite3", api_port)
+    runs: list[Worker] = []
+    monkeypatch.setattr(Worker, "run", lambda self, stop: runs.append(self))
+    # Not retried, so the test does not wait out the retry backoff.
+    transport = httpx.MockTransport(lambda request: httpx.Response(401))
+
+    assert serve(threading.Event(), shopify_transport=transport) == os.EX_UNAVAILABLE
+
+    err = capsys.readouterr().err
+    assert "401" in err
+    assert "placeholder" not in err
+    assert runs == []
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
