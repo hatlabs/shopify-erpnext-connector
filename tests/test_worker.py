@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -1984,6 +1985,22 @@ def test_a_failed_backup_is_logged_and_retried_after_a_wait(
     world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL)
     assert len(backups(world)) == 1
     assert world.worker.last_backup_at == NOW + BACKUP_RETRY_INTERVAL
+
+
+def test_a_backup_failing_partway_leaves_nothing_and_is_retried(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def full_volume(descriptor: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", full_volume)
+        world.worker.back_up_if_due(NOW)
+
+    assert world.worker.last_backup_at is None
+    assert backups(world) == []
+    world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL)
+    assert len(backups(world)) == 1
 
 
 def test_the_loop_backs_up_the_store_between_passes(world: World) -> None:

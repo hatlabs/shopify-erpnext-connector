@@ -10,7 +10,7 @@ known after a restart.
 import os
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,15 +36,22 @@ def take_backup(source: sqlite3.Connection, directory: Path, now: datetime) -> P
     directory.mkdir(exist_ok=True)
     partial = directory / _PARTIAL_NAME
     partial.unlink(missing_ok=True)
-    with closing(sqlite3.connect(partial, isolation_level=None)) as copy:
-        # One step copies a snapshot under a read transaction; in WAL mode
-        # writers do not wait for it, so the writer lock is not needed.
-        source.backup(copy)
-        copy.execute("PRAGMA journal_mode = DELETE")
-    with partial.open("rb") as file:
-        os.fsync(file.fileno())
     path = directory / now.astimezone(UTC).strftime(_NAME_FORMAT)
-    partial.replace(path)
+    try:
+        with closing(sqlite3.connect(partial, isolation_level=None)) as copy:
+            # One step copies a snapshot under a read transaction; in WAL mode
+            # writers do not wait for it, so the writer lock is not needed.
+            source.backup(copy)
+            copy.execute("PRAGMA journal_mode = DELETE")
+        with partial.open("rb") as file:
+            os.fsync(file.fileno())
+        partial.replace(path)
+    except BaseException:
+        # On a full volume the partial copy holds space the store needs
+        # until the next attempt.
+        with suppress(OSError):
+            partial.unlink(missing_ok=True)
+        raise
     _fsync_directory(directory)
     return path
 

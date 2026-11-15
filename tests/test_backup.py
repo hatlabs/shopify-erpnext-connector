@@ -136,3 +136,18 @@ def test_a_backup_into_an_unwritable_place_raises(
 
     with pytest.raises(OSError):
         take_backup(store, blocker, NOW)
+
+
+def test_a_failed_copy_removes_its_partial_file(
+    store: sqlite3.Connection, tmp_path: Path
+) -> None:
+    directory = tmp_path / "backups"
+    closed = open_store(tmp_path / "other.sqlite3")
+    closed.close()
+
+    with pytest.raises(sqlite3.Error):
+        take_backup(closed, directory, NOW)
+
+    assert list(directory.iterdir()) == []
+    path = take_backup(store, directory, NOW)
+    assert list(directory.iterdir()) == [path]
