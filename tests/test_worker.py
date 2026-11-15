@@ -1262,20 +1262,51 @@ def test_an_incremental_pass_leaves_another_variants_oversell_open(
     world.store.close()
 
 
-def test_oversell_on_a_keep_selling_variant_is_worded_as_a_build_need(
+def test_orders_beyond_stock_on_a_keep_selling_variant_are_no_oversell(
     world: World,
 ) -> None:
-    world.bind(1, actual=0, available=-2, policy="CONTINUE")
+    world.bind(1, actual=1, reserved=1, available=-2, policy="CONTINUE")
     world.shopify.add_order(1, [(1, 2)], created_at=NOW - SECOND)
 
     world.worker.run_pass(NOW)
 
-    problem = world.problem(ProblemKind.OVERSELL, variant_id(1))
-    assert problem is not None
-    assert problem.details["Shopify inventory policy"] == (
-        "Keeps selling at zero: a build is needed"
-    )
-    assert problem.details["Newest Shopify orders"] == "#1"
+    assert world.open_of(ProblemKind.OVERSELL) == []
+    assert world.shopify.mutations == [[(inventory_item_id(1), 0, -2)]]
+    assert decision(world, 1).explanation["shortfall"] == 2
+
+
+def test_orders_beyond_stock_on_a_stop_at_zero_variant_are_an_oversell(
+    world: World,
+) -> None:
+    world.bind(1, actual=1, reserved=1, available=0)
+    world.shopify.add_order(1, [(1, 2)], created_at=NOW - SECOND)
+
+    world.worker.run_pass(NOW)
+
+    assert world.open_of(ProblemKind.OVERSELL) == [variant_id(1)]
+
+
+def test_production_reservations_beyond_stock_are_no_oversell(world: World) -> None:
+    world.bind(1, available=0)
+    world.erpnext.set_bin(item_code(1), actual=43, reserved_for_production=181)
+
+    world.worker.run_pass(NOW)
+
+    assert world.open_of(ProblemKind.OVERSELL) == []
+    assert decision(world, 1).explanation["sellable"] == 0
+
+
+def test_oversell_resolves_once_the_variant_keeps_selling(world: World) -> None:
+    world.bind(1, actual=0, available=0)
+    world.shopify.add_order(1, [(1, 1)], created_at=NOW - SECOND)
+    world.worker.run_pass(NOW)
+    assert world.open_of(ProblemKind.OVERSELL) == [variant_id(1)]
+
+    world.shopify.levels[inventory_item_id(1)] = (0, "CONTINUE")
+    world.worker.run_pass(NOW + FULL_PASS_INTERVAL)
+
+    assert world.worker.last_pass_full
+    assert world.open_of(ProblemKind.OVERSELL) == []
 
 
 def test_demand_covered_by_planned_production_is_no_oversell(world: World) -> None:

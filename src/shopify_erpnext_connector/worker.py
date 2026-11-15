@@ -130,10 +130,9 @@ _ACTIONS = {
 }
 _SETTLED = frozenset({PushOutcome.PUSHED, PushOutcome.UNCHANGED})
 
-_POLICY_TEXTS = {
-    "DENY": "Stops selling at zero",
-    "CONTINUE": "Keeps selling at zero: a build is needed",
-}
+# The `inventoryPolicy` of a variant Shopify keeps selling at zero.
+CONTINUE_SELLING = "CONTINUE"
+_POLICY_TEXTS = {"DENY": "Stops selling at zero"}
 
 # The binding problems' detail naming the variant's current SKU.
 SKU_DETAIL = "SKU"
@@ -484,7 +483,7 @@ class Worker:
         record_check(
             connection,
             ProblemKind.OVERSELL,
-            [_oversell(c, match) for c in computed if c.sellable.shortfall > 0],
+            [_oversell(c, match) for c in computed if _is_oversold(c)],
             now,
             checked=None if full else {c.binding.variant_id for c in computed},
         )
@@ -685,6 +684,13 @@ class Worker:
             [(c.binding.variant_id, c.decision(action)) for c, action in decisions],
             now,
         )
+
+
+def _is_oversold(computed: _Computed) -> bool:
+    # A CONTINUE variant sells past stock by design: backorders, no problem.
+    # Any other policy counts as DENY, so an unknown one never hides an
+    # oversell.
+    return computed.sellable.shortfall > 0 and computed.level.policy != CONTINUE_SELLING
 
 
 def _oversell(computed: _Computed, match: OrderMatch) -> Problem:
