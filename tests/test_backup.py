@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from shopify_erpnext_connector import backup
 from shopify_erpnext_connector.backup import (
     KEEP_BACKUPS,
     backup_directory,
@@ -151,3 +152,16 @@ def test_a_failed_copy_removes_its_partial_file(
     assert list(directory.iterdir()) == []
     path = take_backup(store, directory, NOW)
     assert list(directory.iterdir()) == [path]
+
+
+def test_a_first_backup_syncs_the_new_directory_entry(
+    store: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced: list[Path] = []
+    monkeypatch.setattr(backup, "_fsync_directory", synced.append)
+    directory = tmp_path / "backups"
+
+    take_backup(store, directory, NOW)
+    take_backup(store, directory, NOW + DAY)
+
+    assert synced == [tmp_path, directory, directory]

@@ -33,7 +33,11 @@ def take_backup(source: sqlite3.Connection, directory: Path, now: datetime) -> P
     The copy is written under a temporary name, synced and renamed, so a
     dated file is always complete.
     """
-    directory.mkdir(exist_ok=True)
+    if not directory.exists():
+        directory.mkdir()
+        # The new directory's own entry must survive a crash too, or the
+        # first backup is lost with it.
+        _fsync_directory(directory.parent)
     partial = directory / _PARTIAL_NAME
     partial.unlink(missing_ok=True)
     path = directory / now.astimezone(UTC).strftime(_NAME_FORMAT)
