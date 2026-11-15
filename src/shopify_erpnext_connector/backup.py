@@ -63,9 +63,11 @@ def prune_backups(directory: Path) -> None:
 
 def _backups(directory: Path) -> list[Path]:
     """The backups in `directory`, newest first."""
+    # An unreadable directory has no backups to report; writing a backup into
+    # it fails and is logged.
     try:
         names = [p for p in directory.iterdir() if _NAME.fullmatch(p.name)]
-    except FileNotFoundError:
+    except OSError:
         return []
     return sorted(names, key=lambda p: p.name, reverse=True)
 
