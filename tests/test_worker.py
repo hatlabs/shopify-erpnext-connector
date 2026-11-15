@@ -1,7 +1,11 @@
 import json
+import logging
+import os
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Collection, Iterator
+from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,7 +14,9 @@ import httpx
 import pytest
 from helpers import ERPNEXT_URL, LOCATION_ID, SHOP_DOMAIN, WAREHOUSE, make_config
 
+from shopify_erpnext_connector import worker as worker_module
 from shopify_erpnext_connector.api import ENVIRONMENT_HEADER, ApiServer
+from shopify_erpnext_connector.backup import KEEP_BACKUPS, backup_directory
 from shopify_erpnext_connector.bindings import bound_item_code
 from shopify_erpnext_connector.config import ApiConfig, Config, Secret
 from shopify_erpnext_connector.decisions import (
@@ -37,6 +43,8 @@ from shopify_erpnext_connector.store import (
     utc_timestamp,
 )
 from shopify_erpnext_connector.worker import (
+    BACKUP_INTERVAL,
+    BACKUP_RETRY_INTERVAL,
     BINDING_PROBLEM_KINDS,
     EMAIL_CHECK_INTERVAL,
     FULL_PASS_INTERVAL,
@@ -379,7 +387,8 @@ def _filter_values(filters: list[list[object]], field: str) -> list[str]:
 class World:
     def __init__(self, path: Path, config: Config) -> None:
         self.path = path
-        self.config = config
+        # Backups go next to the store, so the config must name the test's store.
+        self.config = replace(config, store_path=path)
         self.store = open_store(path)
         set_dry_run(self.store, False)
         self.shopify = FakeShopify()
@@ -1911,3 +1920,130 @@ def test_push_and_rerun_wait_for_the_running_loops_pass(world: World) -> None:
     assert rerun["dry_run"] is False
     assert rerun["problem"]["resolved_at"] is not None
     assert world.shopify.available(2) == 4
+
+
+# Store backups
+
+
+def backups(world: World) -> list[Path]:
+    directory = backup_directory(world.path)
+    return sorted(directory.iterdir()) if directory.exists() else []
+
+
+def test_a_backup_is_due_at_start_without_a_previous_one(world: World) -> None:
+    assert world.worker.last_backup_at is None
+
+    world.worker.back_up_if_due(NOW)
+
+    assert len(backups(world)) == 1
+    assert world.worker.last_backup_at == NOW
+
+
+def test_a_backup_is_not_due_until_a_day_after_the_last(world: World) -> None:
+    world.worker.back_up_if_due(NOW)
+
+    world.worker.back_up_if_due(NOW + BACKUP_INTERVAL - SECOND)
+    assert len(backups(world)) == 1
+
+    world.worker.back_up_if_due(NOW + BACKUP_INTERVAL)
+    assert len(backups(world)) == 2
+    assert world.worker.last_backup_at == NOW + BACKUP_INTERVAL
+
+
+def test_the_last_backup_survives_a_restart(world: World) -> None:
+    world.worker.back_up_if_due(NOW)
+
+    restarted = world.new_worker()
+    restarted.back_up_if_due(NOW + BACKUP_INTERVAL - SECOND)
+
+    assert restarted.last_backup_at == NOW
+    assert len(backups(world)) == 1
+
+
+def test_old_backups_are_pruned(world: World) -> None:
+    for day in range(KEEP_BACKUPS + 2):
+        world.worker.back_up_if_due(NOW + day * BACKUP_INTERVAL)
+
+    kept = backups(world)
+    assert len(kept) == KEEP_BACKUPS
+    assert world.worker.last_backup_at == NOW + (KEEP_BACKUPS + 1) * BACKUP_INTERVAL
+
+
+def test_a_failed_backup_is_logged_and_retried_after_a_wait(
+    world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    blocker = backup_directory(world.path)
+    blocker.write_bytes(b"a file where the directory should be")
+
+    with caplog.at_level(logging.WARNING):
+        world.worker.back_up_if_due(NOW)
+
+    assert "backup" in caplog.text
+    assert world.worker.last_backup_at is None
+    blocker.unlink()
+    world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL - SECOND)
+    assert backups(world) == []
+    world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL)
+    assert len(backups(world)) == 1
+    assert world.worker.last_backup_at == NOW + BACKUP_RETRY_INTERVAL
+
+
+def test_a_backup_failing_in_sqlite_is_logged_and_retried_after_a_wait(
+    world: World, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def disk_full(*args: object) -> Path:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(worker_module, "take_backup", disk_full)
+        with caplog.at_level(logging.WARNING):
+            world.worker.back_up_if_due(NOW)
+        assert "database or disk is full" in caplog.text
+        assert world.worker.last_backup_at is None
+        world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL - SECOND)
+        assert caplog.text.count("database or disk is full") == 1
+
+    world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL)
+    assert len(backups(world)) == 1
+    assert world.worker.last_backup_at == NOW + BACKUP_RETRY_INTERVAL
+
+
+def test_a_backup_failing_partway_leaves_nothing_and_is_retried(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def full_volume(descriptor: int) -> None:
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", full_volume)
+        world.worker.back_up_if_due(NOW)
+
+    assert world.worker.last_backup_at is None
+    assert backups(world) == []
+    world.worker.back_up_if_due(NOW + BACKUP_RETRY_INTERVAL)
+    assert len(backups(world)) == 1
+
+
+def test_the_loop_backs_up_the_store_between_passes(world: World) -> None:
+    worker = sleep_long(world)
+    world.bind(1, actual=3, available=0)
+    first = request(worker)
+    answered: list[PassResult] = []
+
+    def client() -> None:
+        answered.append(worker.wait_for_pass(first, WAIT_SECONDS))
+        # The backup runs after the first pass, before this one.
+        answered.append(worker.wait_for_pass(request(worker), WAIT_SECONDS))
+
+    run_alongside(worker, client)
+
+    assert answered == [PassResult.COMPLETED, PassResult.COMPLETED]
+    assert world.shopify.available(1) == 3
+    [backup] = backups(world)
+    with closing(sqlite3.connect(backup)) as copy:
+        pushed = copy.execute(
+            "SELECT available FROM push_history WHERE variant_id = ?",
+            (variant_id(1),),
+        ).fetchall()
+    assert pushed == [(3,)]
+    assert worker.last_backup_at == NOW

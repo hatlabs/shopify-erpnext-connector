@@ -76,6 +76,7 @@ class FakeWorker:
     last_pass_at: datetime | None = None
     last_pass_full: bool = False
     last_full_pass_at: datetime | None = None
+    last_backup_at: datetime | None = None
     writer_lock: threading.Lock = field(default_factory=threading.Lock)
     requests: list[PassRequest] = field(default_factory=list)
     # How a waited-for pass goes, and what it does to the store meanwhile.

@@ -30,6 +30,7 @@ MAX_THROTTLE_RETRIES = 5
 THROTTLE_FALLBACK_SECONDS = 1.0
 
 THROTTLED = "THROTTLED"
+ACCESS_DENIED = "ACCESS_DENIED"
 CHANGE_FROM_QUANTITY_STALE = "CHANGE_FROM_QUANTITY_STALE"
 
 _log = logging.getLogger(__name__)
@@ -43,6 +44,11 @@ mutation SetAvailable(
     inventoryAdjustmentGroup { id }
     userErrors { code field message }
   }
+}
+"""
+_LOCATION = """\
+query Location($id: ID!) {
+  location(id: $id) { id isActive }
 }
 """
 # The user error `field` path of an entry: ["input", "quantities", "<index>", ...].
@@ -120,6 +126,10 @@ class ShopifyGraphQLError(ShopifyError):
         self.codes = codes
 
 
+class LocationError(ShopifyError):
+    """The pinned location cannot be used: missing, inactive or not readable."""
+
+
 class ShopifyUserError(ShopifyError):
     """A mutation's userErrors. Shopify applied none of the batch's entries."""
 
@@ -157,6 +167,7 @@ class ShopifyClient:
         *,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        self._shop_domain = config.shop_domain
         self._pinned = httpx.URL(f"https://{config.shop_domain}")
         self._location_id = config.location_id
         self._token = config.secrets.shopify_access_token
@@ -206,6 +217,35 @@ class ShopifyClient:
             self._throttle = None
             self._sleep(delay)
         raise AssertionError("unreachable: the last attempt returns or raises")
+
+    def check_location(self) -> None:
+        """Raise `LocationError` unless the pinned location is active in the shop."""
+        where = f"location {self._location_id} in shop {self._shop_domain}"
+        try:
+            data = self.execute(_LOCATION, {"id": self._location_id}, idempotent=True)
+        except ShopifyGraphQLError as error:
+            if ACCESS_DENIED in error.codes:
+                raise LocationError(
+                    f"cannot read {where}: the Shopify access token lacks "
+                    "the read_locations scope"
+                ) from None
+            raise
+        except ShopifyHTTPError as error:
+            if error.status in (HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN):
+                raise LocationError(
+                    "Shopify rejected the access token for shop "
+                    f"{self._shop_domain} ({error.status})"
+                ) from None
+            raise
+        location = data.get("location")
+        if location is None:
+            raise LocationError(f"{where} not found")
+        if not isinstance(location, dict) or not isinstance(
+            location.get("isActive"), bool
+        ):
+            raise ShopifyError(f"{where}: unexpected response")
+        if not location["isActive"]:
+            raise LocationError(f"{where} is not active")
 
     def set_quantities(self, batch: InventoryBatch) -> None:
         if not 0 < len(batch.changes) <= BATCH_LIMIT:

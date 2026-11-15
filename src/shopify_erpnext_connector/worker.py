@@ -34,6 +34,10 @@ with `wait_for_pass`. The request wakes the loop from its sleep, and the items
 it names, and a requested full pass, skip their retry waits: the operator
 asked for this attempt. Their failure counts stay, so requests made during an
 outage do not shorten the waits after it.
+
+Between passes the loop backs up the store once a day; a failed backup is
+retried after `BACKUP_RETRY_INTERVAL`, not on every iteration. The last
+backup's time comes from the backup files, so it survives a restart.
 """
 
 import logging
@@ -49,6 +53,12 @@ from shopify_erpnext_connector.availability import (
     Sellable,
     compute_sellable,
     fetch_bins,
+)
+from shopify_erpnext_connector.backup import (
+    backup_directory,
+    last_backup_at,
+    prune_backups,
+    take_backup,
 )
 from shopify_erpnext_connector.bindings import (
     Binding,
@@ -101,6 +111,10 @@ SALE_SETTLE_HOLD = timedelta(seconds=60)
 # How often problem emails are sent and their delivery checked: each check
 # reads the status of every undelivered email.
 EMAIL_CHECK_INTERVAL = timedelta(minutes=1)
+BACKUP_INTERVAL = timedelta(days=1)
+# Long enough that a full disk is not retried every iteration, short enough
+# that a fixed one is backed up the same day.
+BACKUP_RETRY_INTERVAL = timedelta(hours=1)
 # How often the sleep between passes checks `stop`, which ends the loop.
 STOP_CHECK_SECONDS = 0.1
 
@@ -248,6 +262,9 @@ class Worker:
         self._computing: list[str] = []
         self._held_since: dict[str, datetime] = {}
         self._last_email_check_at: datetime | None = None
+        self._backup_directory = backup_directory(config.store_path)
+        self._last_backup_at = last_backup_at(self._backup_directory)
+        self._backup_failed_at: datetime | None = None
         # Guards the pass counters and the wake flag below.
         self._passes = threading.Condition()
         self._passes_started = 0
@@ -268,6 +285,11 @@ class Worker:
     def last_full_pass_at(self) -> datetime | None:
         """When the last full pass that completed started; None before the first."""
         return self._last_full_pass_at
+
+    @property
+    def last_backup_at(self) -> datetime | None:
+        """When the newest store backup was taken; None if there is none."""
+        return self._last_backup_at
 
     def request_pass(self, *, full: bool = False, items: Collection[str] = ()) -> int:
         """Ask for a pass to start now; return its ticket for `wait_for_pass`.
@@ -308,7 +330,40 @@ class Worker:
         interval = self._config.worker.poll_interval.total_seconds()
         while not stop.is_set():
             self.run_pass(self._clock())
+            if not stop.is_set():
+                self.back_up_if_due(self._clock())
             self._sleep(interval, stop)
+
+    def back_up_if_due(self, now: datetime) -> None:
+        """Back up the store if a day has passed since the last backup.
+
+        Called between passes only: the backup reads through the pass's
+        connection.
+        """
+        last = self._last_backup_at
+        if last is not None and now - last < BACKUP_INTERVAL:
+            return
+        failed = self._backup_failed_at
+        if failed is not None and now - failed < BACKUP_RETRY_INTERVAL:
+            return
+        try:
+            path = take_backup(self._connection, self._backup_directory, now)
+        except (OSError, sqlite3.Error) as error:
+            self._backup_failed_at = now
+            _log.warning(
+                "store backup into %s failed; retrying in %s: %s",
+                self._backup_directory,
+                BACKUP_RETRY_INTERVAL,
+                error,
+            )
+            return
+        self._last_backup_at = now
+        self._backup_failed_at = None
+        _log.info("store backed up to %s", path)
+        try:
+            prune_backups(self._backup_directory)
+        except OSError as error:
+            _log.warning("cannot delete old store backups: %s", error)
 
     def _sleep(self, seconds: float, stop: threading.Event) -> None:
         """Sleep until `seconds` pass, a pass is requested or `stop` is set."""

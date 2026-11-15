@@ -401,6 +401,7 @@ def test_metrics_before_the_first_pass(client: httpx.Client) -> None:
         **{f'connector_open_problems{{kind="{kind}"}}': 0 for kind in ProblemKind},
         "connector_unsent_emails": 0,
         "connector_dry_run": 1,
+        "connector_last_backup_timestamp_seconds": 0,
     }
 
 
@@ -428,6 +429,18 @@ def test_metrics_report_the_last_pass(client: httpx.Client, worker: FakeWorker) 
     )
     assert samples["connector_last_pass_full"] == 1
     assert samples["connector_pass_stale"] == 0
+
+
+def test_metrics_report_the_last_backup(
+    client: httpx.Client, worker: FakeWorker
+) -> None:
+    worker.last_backup_at = NOW - timedelta(hours=5)
+
+    samples = metrics(client)
+
+    assert samples["connector_last_backup_timestamp_seconds"] == (
+        (NOW - timedelta(hours=5)).timestamp()
+    )
 
 
 def test_metrics_report_the_last_full_pass(
