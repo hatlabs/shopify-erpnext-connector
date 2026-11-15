@@ -8,8 +8,9 @@ import httpx
 import pytest
 from helpers import LOCATION_ID, SHOP_DOMAIN
 
-from shopify_erpnext_connector.api import ENVIRONMENT_HEADER
-from shopify_erpnext_connector.config import DEFAULT_API_PORT
+from shopify_erpnext_connector import service
+from shopify_erpnext_connector.api import ENVIRONMENT_HEADER, ApiServer
+from shopify_erpnext_connector.config import DEFAULT_API_PORT, Config
 from shopify_erpnext_connector.service import install_stop_handlers, serve
 from shopify_erpnext_connector.store import dry_run, open_store
 from shopify_erpnext_connector.worker import Worker
@@ -207,6 +208,14 @@ def test_unusable_location_refuses_to_start_before_the_api_and_worker(
     write_config(tmp_path, monkeypatch, tmp_path / "connector.sqlite3", api_port)
     runs: list[Worker] = []
     monkeypatch.setattr(Worker, "run", lambda self, stop: runs.append(self))
+    servers: list[ApiServer] = []
+
+    def recording_server(config: Config, worker: Worker) -> ApiServer:
+        server = ApiServer(config, worker)
+        servers.append(server)
+        return server
+
+    monkeypatch.setattr(service, "ApiServer", recording_server)
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json=body))
 
     # Not set: a refusal must return without the worker ever starting.
@@ -217,6 +226,7 @@ def test_unusable_location_refuses_to_start_before_the_api_and_worker(
         assert text in err
     assert "placeholder" not in err
     assert runs == []
+    assert servers == []
 
 
 def test_rejected_token_at_the_location_check_is_a_configuration_error(
