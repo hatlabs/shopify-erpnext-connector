@@ -25,6 +25,10 @@
 {$CONNECTOR_HOST} {
 	tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
 
+	# The connector sees only Caddy's address, so the client of a request is
+	# recorded here. Caddy redacts the Authorization header in access logs.
+	log
+
 	# The API refuses bodies over 64 KiB; refuse them here before they reach it.
 	request_body {
 		max_size 64KiB
