@@ -2,8 +2,11 @@
 
 Sellable is what may be offered on Shopify: stock on hand less what Sales
 Orders and Work Orders have reserved and less the Shopify orders ERPNext has
-not mirrored yet. Planned production is not sellable, but it does cover
-demand, so it counts only toward the oversell shortfall.
+not mirrored yet. The oversell shortfall is order demand, Sales Order
+reservations and unmirrored Shopify orders, beyond what stock on hand and
+planned production leave once Work Orders have taken their reservations.
+Planned production is not sellable, but it does cover demand. Work Orders
+reserving more than there is raise no shortfall by themselves.
 """
 
 import math
@@ -60,9 +63,9 @@ ZERO_BIN = BinQuantities(0, 0, 0, 0)
 class Sellable:
     """The quantities of one computation, kept for the decision record.
 
-    `shortfall` is the demand stock and planned production cannot cover,
-    0 when there is no oversell. `old_formula` is what ecommerce-integrations
-    would push.
+    `shortfall` is the order demand that stock and planned production leave
+    uncovered after Work Order reservations, 0 when there is no oversell.
+    `old_formula` is what ecommerce-integrations would push.
     """
 
     bin: BinQuantities
@@ -91,12 +94,21 @@ def compute_sellable(bin: BinQuantities, unmirrored: int) -> Sellable:
         - quantity(bin.reserved_for_production)
         - unmirrored
     )
-    covered = free + quantity(bin.planned)
+    orders = quantity(bin.reserved) + unmirrored
+    # Work Orders take their share first, so an excess of theirs alone is no
+    # oversell, but an order arriving after they took everything is.
+    left_for_orders = max(
+        Decimal(0),
+        quantity(bin.actual)
+        + quantity(bin.planned)
+        - quantity(bin.reserved_for_production),
+    )
+    uncovered = orders - left_for_orders
     return Sellable(
         bin=bin,
         unmirrored=unmirrored,
         sellable=max(0, math.floor(free)),
-        shortfall=max(0, math.ceil(-covered)),
+        shortfall=max(0, math.ceil(uncovered)),
         # ecommerce-integrations pushes cint(actual) - cint(reserved).
         old_formula=int(bin.actual) - int(bin.reserved),
     )

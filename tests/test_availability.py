@@ -94,6 +94,52 @@ def test_fractional_shortfall_is_rounded_up() -> None:
     assert compute_sellable(bin_of(actual=1, reserved=1.5), 0).shortfall == 1
 
 
+def test_production_reservations_beyond_stock_are_no_shortfall() -> None:
+    result = compute_sellable(bin_of(actual=43, reserved_for_production=181), 0)
+
+    assert result.shortfall == 0
+    assert result.sellable == 0
+
+
+def test_orders_count_against_what_work_orders_leave() -> None:
+    quantities = bin_of(actual=2, reserved=3, reserved_for_production=10)
+
+    result = compute_sellable(quantities, 1)
+
+    assert result.shortfall == 4
+
+
+def test_an_order_racing_a_work_order_reservation_is_short() -> None:
+    result = compute_sellable(bin_of(actual=10, reserved_for_production=10), 2)
+
+    assert result.shortfall == 2
+    assert result.sellable == 0
+
+
+def test_orders_within_what_work_orders_leave_are_no_shortfall() -> None:
+    quantities = bin_of(actual=10, reserved=3, reserved_for_production=5)
+
+    assert compute_sellable(quantities, 2).shortfall == 0
+
+
+def test_orders_beyond_stock_and_planned_give_the_shortfall() -> None:
+    result = compute_sellable(bin_of(actual=1, reserved=3, planned=1), 2)
+
+    assert result.shortfall == 3
+
+
+def test_fractional_order_shortfall_is_rounded_up_past_production() -> None:
+    quantities = bin_of(actual=4.5, reserved=1.5, reserved_for_production=4.2)
+
+    assert compute_sellable(quantities, 0).shortfall == 2
+
+
+def test_planned_production_counts_before_work_orders_take_theirs() -> None:
+    quantities = bin_of(actual=2, planned=5, reserved_for_production=4)
+
+    assert compute_sellable(quantities, 4).shortfall == 1
+
+
 def test_old_formula_truncates_and_goes_negative() -> None:
     quantities = bin_of(actual=1.9, reserved=3.7, reserved_for_production=5)
 
